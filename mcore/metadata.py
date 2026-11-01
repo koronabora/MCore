@@ -56,7 +56,9 @@ def parse_detail(provider, html, url):
             if src.startswith(('http://', 'https://')) and src not in pictures:
                 pictures.append(src)
     director = re.split(r'\s+(?:О фильме|О сериале|Описание|В ролях|Акт[её]ры|Жанр|Страна|Год выпуска)\s*:', field('Режисс[её]р'), maxsplit=1, flags=re.I)[0]
+    magnet = next((a['href'] for a in soup.select('a[href^="magnet:?"]') if re.search(r'xt=urn:btih:(?:[a-fA-F0-9]{40}|[A-Z2-7]{32})(?:&|$)', a['href'])), '')
     return {'description': description[:12000], 'director': director[:500],
+            'magnet': magnet,
             'poster': poster, 'screenshots': [p for p in pictures if p != poster][:3], 'audio': field('Аудио')[:1500],
             'external_ids': identifiers,
             'dimensions': dimensions[0] if dimensions else '',

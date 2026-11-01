@@ -175,7 +175,7 @@ class Torrents:
         status = handle.status()
         result = {'id': key, 'progress': status.progress, 'download_rate': status.download_payload_rate,
                   'seeds': status.num_seeds, 'peers': status.num_peers, 'files': self.files(key),
-                  'ready': False, 'buffer_eta': None,
+                  'ready': False, 'buffer_eta': None, 'metadata_ready': bool(status.has_metadata),
                   'error': self.errors.get(key) or (str(status.errc.message()) if status.errc.value() else None)}
         if status.has_metadata:
             _, info, _, size, offset = self.file(key, index)

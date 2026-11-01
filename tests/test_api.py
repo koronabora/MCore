@@ -136,6 +136,37 @@ def test_buffer_requires_entire_index_window(client, monkeypatch):
         del manager.handles['index-test']
 
 
+def test_start_existing_torrent_reuses_handle_without_tracker(client, monkeypatch):
+    auth=login(client,'reuse-torrent')
+    release=normalize('local',{'Id':'98','Title':'Reuse (2026)'})
+    release['torrent_id']='reuse'
+    app.state.catalog.put(release)
+    app.state.torrents.handles['reuse']=object()
+    async def unavailable(_):
+        raise AssertionError('Existing torrent must not contact tracker')
+    monkeypatch.setattr(app.state.catalog,'detail',unavailable)
+    try:
+        assert client.post('/v1/torrents',headers=auth,json={'release':'local:98'}).json()=={'id':'reuse'}
+    finally: del app.state.torrents.handles['reuse']
+
+
+def test_missing_source_returns_actionable_error(client, monkeypatch):
+    auth=login(client,'missing-source')
+    async def detail(_): return normalize('local',{'Id':'99','Title':'Unavailable (2026)'})
+    monkeypatch.setattr(app.state.catalog,'detail',detail)
+    response=client.post('/v1/torrents',headers=auth,json={'release':'local:99'})
+    assert response.status_code==409
+    assert response.json()['detail']['code']=='source_missing'
+
+
+def test_disc_folder_is_not_reported_as_waiting_for_metadata(client, monkeypatch):
+    auth=login(client,'disc-folder')
+    monkeypatch.setattr(app.state.torrents,'status',lambda *_: {'metadata_ready':True,'files':[],'error':None})
+    response=client.get('/v1/torrents/disc',headers=auth)
+    assert response.status_code==200
+    assert 'Blu-ray' in response.json()['error']
+
+
 def test_verified_range_limits_and_unavailable_data(client, monkeypatch):
     auth = login(client, 'verified')
     monkeypatch.setattr(app.state.torrents, 'file', lambda *_: (None, None, None, 8*1024*1024, 0))

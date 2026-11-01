@@ -227,29 +227,34 @@ class Catalog:
         with self.store.connect() as db:
             rows = db.execute('SELECT data FROM releases ORDER BY updated DESC').fetchall()
         grouped = {}
+        query_key = title_key(query)
+        query_words = query_key.split()
         for row in rows:
             item = json.loads(row['data'])
             if not self.enabled(item):
                 continue
-            score = WRatio(query.casefold(), item['title'].casefold()) if query else 100
-            exact = bool(query) and title_key(query) in {title_key(t) for t in item.get('title_aliases', []) + [item['title']]}
-            if exact:
-                score = 120 if title_key(query) == title_key(item['title']) else 100
+            names = {title_key(t) for t in item.get('title_aliases', []) + [item['title']]}
+            exact = bool(query_words) and query_key in names
+            keyword_match = bool(query_words) and any(all(word in name.split() for word in query_words) for name in names)
+            score = max((WRatio(query_key, name) for name in names), default=0) if query else 100
+            if keyword_match:
+                score = 120 if query_key in names else 110
             if query and query.casefold() in item.get('search_queries', []):
-                score = max(score, 65)
-            if query and score < 65:
+                score = max(score, 75)
+            if query and score < 75:
                 continue
             mid = item['movie']
             if mid not in grouped:
                 grouped[mid] = {k: item[k] for k in ('title', 'year', 'director', 'description')}
-                grouped[mid].update(id=mid, releases=[], score=score, exact=exact, series=item.get('series', False))
+                grouped[mid].update(id=mid, releases=[], score=score, exact=exact, keyword_match=keyword_match, series=item.get('series', False))
             grouped[mid]['score'] = max(grouped[mid]['score'], score)
             grouped[mid]['exact'] |= exact
+            grouped[mid]['keyword_match'] |= keyword_match
             for field in ('description', 'director'):
                 if not grouped[mid][field] and item.get(field):
                     grouped[mid][field] = item[field]
             grouped[mid]['releases'].append(self.public(item))
-        return sorted(grouped.values(), key=lambda m: (not m['exact'], -m['score'], m['series'], m['title']))[:100]
+        return sorted(grouped.values(), key=lambda m: (not m['exact'], not m['keyword_match'], -m['score'], m['series'], m['title']))[:100]
 
     @staticmethod
     def public(item):

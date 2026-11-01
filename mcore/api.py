@@ -37,7 +37,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.1', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.2', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -99,9 +99,17 @@ async def search(q: str = Query(min_length=1, max_length=150), live: bool = True
     if live:
         with app.state.store.connect() as db:
             db.execute('INSERT OR REPLACE INTO queries VALUES (?,?,?)', (uid, q, time.time()))
-    errors = await asyncio.gather(*(catalog.provider_search(p, q) for p in catalog.config['providers'])) if live else []
-    if live or len(q) >= 4:
-        await catalog.enrich(catalog.movies(q))
+    async def refresh(provider):
+        from .catalog import title_key
+        normalized = title_key(q)
+        variants = list(dict.fromkeys([normalized, re.sub(r'\s+', '-', normalized)])) if len(normalized.split()) == 2 else [normalized]
+        try:
+            outcomes = await asyncio.wait_for(asyncio.gather(*(catalog.provider_search(provider, value) for value in variants)), 25)
+            return provider if all(outcomes) else None
+        except TimeoutError:
+            return provider
+    errors = await asyncio.gather(*(refresh(p) for p in catalog.config['providers'])) if live else []
+    # Suggestions must not wait for tracker detail pages. Posters hydrate independently.
     return {'movies': catalog.movies(q), 'unavailable_providers': [e for e in errors if e]}
 
 
@@ -249,23 +257,39 @@ class Start(BaseModel):
 
 @app.post('/v1/torrents')
 async def start(body: Start, uid=Depends(user)):
+    lock = app.state.catalog.detail_locks.setdefault('torrent:'+body.release, asyncio.Lock())
+    async with lock:
+        cached = app.state.catalog.release(body.release)
+        if cached and cached.get('torrent_id') in app.state.torrents.handles:
+            return {'id': cached['torrent_id']}
+        return await start_release(body)
+
+
+async def start_release(body):
     release = await app.state.catalog.detail(body.release)
     if not release:
         raise HTTPException(404, 'Release not found')
     try:
         if app.state.catalog.jackett and not release.get('download') and not release.get('magnet'):
-            await app.state.catalog.provider_search(release['provider'], release['title'])
+            from .catalog import title_key
+            await app.state.catalog.provider_search(release['provider'], title_key(release['title']))
             release = app.state.catalog.release(body.release)
-        source = release['magnet']
+        if not release.get('download') and not release.get('magnet') and app.state.catalog.metadata:
+            fresh = await app.state.catalog.metadata.detail(release['provider'], release['source_id'])
+            release['magnet'] = fresh.get('magnet', '')
+            app.state.catalog.put(release)
+        source = release.get('magnet', '')
         if app.state.catalog.jackett and release.get('download'):
             source = await app.state.catalog.jackett.download(release['download'])
+        if not source:
+            raise HTTPException(409, detail={'code': 'source_missing', 'message': 'Источник не предоставил torrent или magnet. Выберите другую раздачу.'})
         key = await app.state.torrents.add(source)
         release['torrent_id'] = key
         app.state.catalog.put(release)
     except httpx.HTTPError:
-        raise HTTPException(502, 'Jackett download unavailable')
+        raise HTTPException(502, detail={'code':'tracker_unavailable', 'message':'Трекер временно не отдаёт раздачу. Повторите позже или выберите другую.'})
     except (ValueError, RuntimeError) as error:
-        raise HTTPException(409, str(error)) from error
+        raise HTTPException(409, detail={'code':'torrent_invalid', 'message':'Не удалось прочитать данные торрента. Выберите другую раздачу.'}) from error
     return {'id': key}
 
 
@@ -273,6 +297,8 @@ async def start(body: Start, uid=Depends(user)):
 async def status(key: str, file: int = Query(default=0, ge=0), buffer: int = Query(default=15, ge=1, le=120), position: int = Query(default=0, ge=0, le=604800000), uid=Depends(user)):
     try:
         result = app.state.torrents.status(key, file, buffer, position)
+        if result.get('metadata_ready') and not result['files']:
+            result['error'] = 'В раздаче нет поддерживаемых видеофайлов. Для образов дисков и папок Blu-ray выберите другую раздачу (например, MKV или MP4).'
         if result['files']:
             app.state.inspection.schedule(key, file)
             with app.state.store.connect() as db:
