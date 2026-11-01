@@ -138,7 +138,7 @@ class Torrents:
         if info is None:
             raise ValueError('Metadata not ready')
         files = info.files()
-        if index < 0 or index >= files.num_files() or files.pad_file_at(index):
+        if index < 0 or index >= files.num_files() or files.file_flags(index) & lt.file_storage.flag_pad_file:
             raise ValueError('Invalid file index')
         path = (self.root / key / files.file_path(index)).resolve()
         if not path.is_relative_to((self.root / key).resolve()):
