@@ -27,16 +27,8 @@ if [ -f "$ROOT/deploy/torapi-package-lock.json" ]; then
 else
     npm install --no-progress
 fi
-# Upstream has no bind-address option. Pin the single listener to loopback.
-python3 - <<'PY'
-from pathlib import Path
-p = Path('node_modules/torapi/main.js')
-s = p.read_text()
-before, after = 'const server = web.listen(port)', "const server = web.listen(port, '127.0.0.1')"
-if before not in s and after not in s:
-    raise SystemExit('TorAPI listener changed: inspect upstream before installation')
-p.write_text(s.replace(before, after))
-PY
+python3 "$ROOT/deploy/patch_torapi.py" node_modules/torapi/main.js
+node --check node_modules/torapi/main.js
 install -m 0644 "$ROOT/deploy/mcore.service" "$ROOT/deploy/mcore-torapi.service" /etc/systemd/system/
 install -m 0755 "$ROOT/deploy/mcore-admin" /usr/local/sbin/mcore-admin
 systemctl daemon-reload
