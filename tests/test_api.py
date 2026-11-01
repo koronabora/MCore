@@ -83,6 +83,40 @@ def test_torrent_file_preserves_private_flag_and_metadata(client, tmp_path):
     assert lt.torrent_info(stored.read_bytes()).priv()
 
 
+def test_history_alias_and_legacy_filename_match(client):
+    auth = login(client, 'migration')
+    old = normalize('local', {'Id': '45', 'Title': 'Example / Example original (2024) 1080p'})
+    app.state.catalog.put(old)
+    old_id = old['movie']
+    client.put('/v1/history/'+old_id, headers=auth, json={'position': 1234})
+    changed = dict(old, movie='a'*24)
+    app.state.catalog.put(changed)
+    response = client.get('/v1/movies/'+changed['movie'], headers=auth)
+    assert response.status_code == 200 and response.json()['position'] == 1234
+    assert client.put('/v1/history/'+old_id, headers=auth, json={'position': 5678}).status_code == 200
+    matched = client.get('/v1/library/match', params={'name': 'Example original [2024 BDRip].avi'}, headers=auth)
+    assert matched.json()['movie']['id'] == changed['movie']
+    assert client.get('/v1/library/match', params={'name': 'Unknown.mp4'}, headers=auth).json()['movie'] is None
+
+
+def test_buffer_requires_entire_index_window(client, monkeypatch):
+    from types import SimpleNamespace as NS
+    manager = app.state.torrents
+    available = set(range(15)) | {63}
+    status = NS(progress=.25, download_payload_rate=1024, num_seeds=1, num_peers=1, has_metadata=True, errc=NS(value=lambda: 0))
+    handle = NS(status=lambda: status, have_piece=lambda p: p in available, set_piece_deadline=lambda *_: None)
+    info = NS(piece_length=lambda: 1024*1024, piece_size=lambda _: 1024*1024)
+    manager.handles['index-test'] = handle
+    monkeypatch.setattr(manager, 'files', lambda _: [])
+    monkeypatch.setattr(manager, 'file', lambda *_: (handle, info, None, 64*1024*1024, 0))
+    try:
+        assert not manager.status('index-test')['ready']
+        available.update(range(56, 64))
+        assert manager.status('index-test')['ready']
+    finally:
+        del manager.handles['index-test']
+
+
 def test_verified_range_limits_and_unavailable_data(client, monkeypatch):
     auth = login(client, 'verified')
     monkeypatch.setattr(app.state.torrents, 'file', lambda *_: (None, None, None, 8*1024*1024, 0))
@@ -114,7 +148,7 @@ def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypat
     params.flags &= ~lt.torrent_flags.paused
     handle = seed.add_torrent(params)
     async def detail(_):
-        return {'magnet': lt.make_magnet_uri(info)}
+        return normalize('local', {'Id': '1', 'Title': 'Sample (2026)', 'Magnet': lt.make_magnet_uri(info)})
     monkeypatch.setattr(app.state.catalog, 'detail', detail)
     try:
         app.state.torrents.config['cache_bytes'] = 1048576
