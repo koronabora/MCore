@@ -74,6 +74,8 @@ class Torrents:
         self._check_listener()
         self.handles = {}
         self.active = {}
+        self.errors = {}
+        self.last_used = {}
         self.lock = asyncio.Lock()
         with store.connect() as db:
             rows = db.execute('SELECT * FROM torrents').fetchall()
@@ -82,6 +84,7 @@ class Torrents:
                 path = self.resume / (row['id'] + '.resume')
                 params = lt.read_resume_data(path.read_bytes()) if path.exists() else lt.parse_magnet_uri(row['magnet'])
                 params.save_path = str(self.root / row['id'])
+                params.flags |= lt.torrent_flags.upload_mode
                 self._apply_peer_settings(params)
                 self.handles[row['id']] = self.session.add_torrent(params)
             except Exception:
@@ -115,10 +118,13 @@ class Torrents:
             if key not in self.handles:
                 params.save_path = str(self.root / key)
                 params.flags |= lt.torrent_flags.sequential_download
+                # Metadata is allowed; payload starts only after reserving disk budget.
+                params.flags |= lt.torrent_flags.upload_mode
                 params.flags &= ~lt.torrent_flags.auto_managed
                 params.flags &= ~lt.torrent_flags.paused
                 handle = self.session.add_torrent(params)
                 self.handles[key] = handle
+                self.last_used[key] = time.monotonic()
                 with self.store.connect() as db:
                     db.execute('INSERT OR IGNORE INTO torrents(id,magnet,added) VALUES (?,?,?)', (key, magnet, time.time()))
             return key
@@ -147,10 +153,12 @@ class Torrents:
 
     def status(self, key, index=0, seconds=15):
         handle = self.handles[key]
+        self.last_used[key] = time.monotonic()
         status = handle.status()
         result = {'id': key, 'progress': status.progress, 'download_rate': status.download_payload_rate,
                   'seeds': status.num_seeds, 'peers': status.num_peers, 'files': self.files(key),
-                  'ready': False, 'buffer_eta': None, 'error': str(status.errc.message()) if status.errc.value() else None}
+                  'ready': False, 'buffer_eta': None,
+                  'error': self.errors.get(key) or (str(status.errc.message()) if status.errc.value() else None)}
         if status.has_metadata:
             _, info, _, size, offset = self.file(key, index)
             # Conservative estimate until ffprobe supplies actual duration/bitrate.
@@ -172,6 +180,7 @@ class Torrents:
     async def stream(self, key, index, start, end):
         handle, info, path, _, offset = self.file(key, index)
         self.active[key] = self.active.get(key, 0)+1
+        self.last_used[key] = time.monotonic()
         try:
             cursor = start
             while cursor <= end:
@@ -200,30 +209,46 @@ class Torrents:
             try:
                 async with self.lock:
                     with self.store.connect() as db:
-                        for key, handle in list(self.handles.items()):
-                            info = handle.torrent_file()
-                            if info:
-                                db.execute('UPDATE torrents SET size=? WHERE id=?', (info.total_size(), key))
-                            handle.save_resume_data(lt.save_resume_flags_t.save_info_dict)
                         rows = db.execute('SELECT * FROM torrents ORDER BY added').fetchall()
                         reserved = sum(row['size'] for row in rows)
+                        requested = sum(h.torrent_file().total_size() for key, h in self.handles.items()
+                                        if h.torrent_file() and not next((r['size'] for r in rows if r['id']==key), 0)
+                                        and h.torrent_file().total_size() <= self.config['cache_bytes'])
                         for row in rows:
-                            if reserved <= self.config['cache_bytes']:
+                            if reserved + requested <= self.config['cache_bytes']:
                                 break
                             key = row['id']
                             handle = self.handles.get(key)
-                            if handle and not self.active.get(key) and handle.status().is_seeding:
+                            if (handle and not self.active.get(key) and handle.status().is_seeding
+                                    and time.monotonic()-self.last_used.get(key, 0) > 1800):
                                 self.session.remove_torrent(handle, lt.options_t.delete_files)
                                 del self.handles[key]
                                 db.execute('DELETE FROM torrents WHERE id=?', (key,))
                                 (self.resume / (key+'.resume')).unlink(missing_ok=True)
                                 reserved -= row['size']
-                        # When active jobs exceed the budget, pause them rather than overfill disk.
+                        sizes = {r['id']: r['size'] for r in rows}
                         for key, handle in self.handles.items():
+                            info = handle.torrent_file()
+                            if not info:
+                                continue
+                            if not sizes.get(key):
+                                needed = info.total_size()
+                                if reserved + needed > self.config['cache_bytes']:
+                                    handle.set_upload_mode(True)
+                                    self.errors[key] = 'Cache capacity exhausted; increase cache_bytes or wait for eviction'
+                                    continue
+                                reserved += needed
+                                db.execute('UPDATE torrents SET size=? WHERE id=?', (needed, key))
                             if reserved > self.config['cache_bytes'] or shutil.disk_usage(self.root).free < 1024**3:
                                 handle.pause()
-                            elif handle.status().paused:
-                                handle.resume()
+                                self.errors[key] = 'Insufficient cache budget or free disk space'
+                            else:
+                                handle.set_upload_mode(False)
+                                self.errors.pop(key, None)
+                                if handle.status().paused:
+                                    handle.resume()
+                            if handle.need_save_resume_data():
+                                handle.save_resume_data(lt.save_resume_flags_t.save_info_dict)
                     for alert in self.session.pop_alerts():
                         if isinstance(alert, lt.save_resume_data_alert):
                             key = str(alert.params.info_hashes.get_best())

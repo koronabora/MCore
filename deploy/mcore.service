@@ -14,7 +14,7 @@ RestartSec=3
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
+ProtectSystem=full
 ReadWritePaths=/var/lib/mcore /var/cache/mcore
 
 [Install]
