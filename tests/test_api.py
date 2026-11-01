@@ -99,6 +99,23 @@ def test_history_alias_and_legacy_filename_match(client):
     assert client.get('/v1/library/match', params={'name': 'Unknown.mp4'}, headers=auth).json()['movie'] is None
 
 
+def test_independent_episode_progress_and_completion(client):
+    from mcore.episodes import register
+    auth, other = login(client, 'episodes'), login(client, 'episodes-other')
+    release = normalize('local', {'Id': '71', 'Title': 'Episode fixture S01 2026 1080p'})
+    app.state.catalog.put(release)
+    key = 'd'*40
+    register(app.state.store, release, key, [{'index': 0, 'name': 'Fixture.S01E01.avi'}, {'index': 1, 'name': 'Fixture.S01E02.avi'}])
+    url = '/v1/history/'+release['movie']
+    assert client.put(url, headers=auth, json={'position': 12000, 'torrent': key, 'file': 0, 'episode': 's001e0001'}).status_code == 200
+    assert client.put(url, headers=auth, json={'position': 0, 'torrent': key, 'file': 1, 'episode': 's001e0002', 'completed': True, 'duration': 60000}).status_code == 200
+    movie = client.get('/v1/movies/'+release['movie'], headers=auth).json()
+    assert movie['episodes'][0]['position'] == 12000
+    assert movie['episodes'][1]['completed']
+    assert all(e['position'] == 0 and not e['completed'] for e in client.get('/v1/movies/'+release['movie'], headers=other).json()['episodes'])
+    assert client.put(url, headers=auth, json={'position': 1, 'torrent': key, 'file': 0, 'episode': 's001e0002'}).status_code == 400
+
+
 def test_buffer_requires_entire_index_window(client, monkeypatch):
     from types import SimpleNamespace as NS
     manager = app.state.torrents
