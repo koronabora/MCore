@@ -82,7 +82,14 @@ class Torrents:
         for row in rows:
             try:
                 path = self.resume / (row['id'] + '.resume')
-                params = lt.read_resume_data(path.read_bytes()) if path.exists() else lt.parse_magnet_uri(row['magnet'])
+                metadata = self.resume / (row['id'] + '.torrent')
+                if path.exists():
+                    params = lt.read_resume_data(path.read_bytes())
+                elif metadata.exists():
+                    params = lt.add_torrent_params()
+                    params.ti = lt.torrent_info(metadata.read_bytes())
+                else:
+                    params = lt.parse_magnet_uri(row['magnet'])
                 params.save_path = str(self.root / row['id'])
                 params.flags |= lt.torrent_flags.upload_mode
                 self._apply_peer_settings(params)
@@ -109,13 +116,22 @@ class Torrents:
             params.flags |= lt.torrent_flags.disable_pex
 
     async def add(self, magnet):
-        if not magnet.startswith('magnet:?'):
-            raise ValueError('Source has no magnet link')
-        params = lt.parse_magnet_uri(magnet)
+        metadata = magnet if isinstance(magnet, bytes) else None
+        if metadata is not None:
+            params = lt.add_torrent_params()
+            params.ti = lt.torrent_info(metadata)
+            magnet = lt.make_magnet_uri(params.ti)
+            key = str(params.ti.info_hashes().get_best())
+        else:
+            if not magnet.startswith('magnet:?'):
+                raise ValueError('Source has no magnet link')
+            params = lt.parse_magnet_uri(magnet)
+            key = str(params.info_hashes.get_best())
         self._apply_peer_settings(params)
-        key = str(params.info_hashes.get_best())
         async with self.lock:
             if key not in self.handles:
+                if metadata is not None:
+                    (self.resume / (key + '.torrent')).write_bytes(metadata)
                 params.save_path = str(self.root / key)
                 params.flags |= lt.torrent_flags.sequential_download
                 # Metadata is allowed; payload starts only after reserving disk budget.
@@ -225,6 +241,7 @@ class Torrents:
                                 del self.handles[key]
                                 db.execute('DELETE FROM torrents WHERE id=?', (key,))
                                 (self.resume / (key+'.resume')).unlink(missing_ok=True)
+                                (self.resume / (key+'.torrent')).unlink(missing_ok=True)
                                 reserved -= row['size']
                         sizes = {r['id']: r['size'] for r in rows}
                         for key, handle in self.handles.items():

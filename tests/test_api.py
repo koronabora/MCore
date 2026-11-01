@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import json
 import socket
 import time
@@ -61,6 +62,25 @@ def test_auth_history_isolation_and_reinstallation(client):
     restored = {'Authorization': 'Bearer ' + response.json()['key']}
     assert client.get('/v1/home', headers=restored).json()['history'][0]['position'] == 12345
     assert client.get('/docs').status_code == 404
+
+
+def test_torrent_file_preserves_private_flag_and_metadata(client, tmp_path):
+    files = lt.file_storage()
+    files.add_file('private.mkv', 16384)
+    torrent = lt.create_torrent(files, 16384)
+    torrent.set_priv(True)
+    torrent.add_tracker('http://127.0.0.1:1/announce')
+    (tmp_path / 'private.mkv').write_bytes(b'\x01'*16384)
+    lt.set_piece_hashes(torrent, str(tmp_path))
+    metadata = bytes(lt.bencode(torrent.generate()))
+    manager = app.state.torrents
+    key = asyncio.run(manager.add(metadata))
+    info = manager.handles[key].torrent_file()
+    assert info.priv()
+    assert info.files().file_path(0) == 'private.mkv'
+    stored = manager.resume / (key + '.torrent')
+    assert stored.read_bytes() == metadata
+    assert lt.torrent_info(stored.read_bytes()).priv()
 
 
 def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypatch):
