@@ -27,7 +27,7 @@ async def lifespan(app):
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    await app.state.catalog.client.aclose()
+    await app.state.catalog.close()
     app.state.torrents.session.pause()
 
 
@@ -189,7 +189,12 @@ async def start(body: Start, uid=Depends(user)):
     if not release:
         raise HTTPException(404, 'Release not found')
     try:
-        key = await app.state.torrents.add(release['magnet'])
+        source = release['magnet']
+        if app.state.catalog.jackett and release.get('download'):
+            source = await app.state.catalog.jackett.download(release['download'])
+        key = await app.state.torrents.add(source)
+    except httpx.HTTPError:
+        raise HTTPException(502, 'Jackett download unavailable')
     except (ValueError, RuntimeError) as error:
         raise HTTPException(409, str(error)) from error
     return {'id': key}

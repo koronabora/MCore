@@ -7,6 +7,7 @@ import time
 import unicodedata
 import httpx
 from rapidfuzz.fuzz import WRatio
+from .jackett import Jackett
 
 log = logging.getLogger(__name__)
 
@@ -50,12 +51,19 @@ class Catalog:
         self.client = httpx.AsyncClient(base_url=config['torapi_url'], timeout=35, trust_env=False)
         self.limit = asyncio.Semaphore(4)
         self.sync_status = {}
+        self.jackett = Jackett(config['jackett']) if config.get('jackett') else None
+
+    async def close(self):
+        await self.client.aclose()
+        if self.jackett:
+            await self.jackett.client.aclose()
 
     def put(self, item):
         with self.store.connect() as db:
             prior = db.execute('SELECT data FROM releases WHERE id=?', (item['id'],)).fetchone()
             if prior:
                 old = json.loads(prior['data'])
+                item['search_queries'] = list(dict.fromkeys(item.get('search_queries', []) + old.get('search_queries', [])))[:16]
                 for field in ('director', 'description', 'poster', 'magnet', 'audio', 'screenshots'):
                     item[field] = item.get(field) or old.get(field, '')
             db.execute('INSERT OR REPLACE INTO releases VALUES (?,?,?,?)',
@@ -66,6 +74,14 @@ class Catalog:
             return None
         try:
             async with self.limit:
+                if self.jackett:
+                    for row in await self.jackett.search(provider, query):
+                        item = normalize(provider, row)
+                        if item:
+                            item.update(download=row['download'], description=row['description'], poster=row['poster'],
+                                        search_queries=[query.casefold()] if query else [])
+                            self.put(item)
+                    return None
                 response = await self.client.get('/api/search/title/' + provider, params={'query': query})
                 if response.status_code == 400:
                     return None
@@ -91,6 +107,8 @@ class Catalog:
             if not self.enabled(item):
                 continue
             score = WRatio(query.casefold(), item['title'].casefold()) if query else 100
+            if query and query.casefold() in item.get('search_queries', []):
+                score = 100
             if query and score < 65:
                 continue
             mid = item['movie']
@@ -102,7 +120,7 @@ class Catalog:
 
     @staticmethod
     def public(item):
-        return {k: v for k, v in item.items() if k not in ('magnet', 'poster', 'screenshots')}
+        return {k: v for k, v in item.items() if k not in ('magnet', 'poster', 'screenshots', 'download', 'torrent_data', 'search_queries')}
 
     def release(self, rid):
         with self.store.connect() as db:
@@ -123,6 +141,8 @@ class Catalog:
         if item is None:
             return None
         if item['provider'] == 'local':
+            return item
+        if self.jackett:
             return item
         try:
             async with self.limit:
@@ -172,6 +192,9 @@ class Catalog:
                              (json.loads(r['data']) for r in db.execute('SELECT data FROM releases'))
                              if item['provider'] in self.config['providers']}
                 for provider in self.config['providers']:
+                    if self.jackett:
+                        await self.provider_search(provider, '')
+                        continue
                     try:
                         response = await self.client.get('/api/get/rss/' + provider, headers={'Accept': 'application/json'})
                         response.raise_for_status()

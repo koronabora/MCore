@@ -29,3 +29,12 @@ upload_rate_limit = 0   # bytes/second; 0 = unlimited
 # 0/0 lets the OS choose ephemeral source ports for outbound TCP peer connections.
 outgoing_port_first = 0
 outgoing_port_last = 0
+
+# Optional: use Jackett instead of TorAPI for the configured providers.
+# API key file must be readable by mcore, outside the repository.
+# [jackett]
+# url = "http://127.0.0.1:9117"
+# api_key_file = "/etc/mcore/jackett.key"
+# [jackett.indexers]
+# rutracker = "rutracker"
+# kinozal = "kinozal-magnet"
