@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 *.db*
 *.pem
+*.crt
 *.key
 *.env
 secrets/

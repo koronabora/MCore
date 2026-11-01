@@ -20,7 +20,13 @@ chmod 0640 /etc/mcore/tls.key /etc/mcore/tls.crt
 python3 -m venv --system-site-packages /opt/mcore/venv
 /opt/mcore/venv/bin/pip install --disable-pip-version-check -q -r "$ROOT/requirements.txt"
 cd /opt/mcore/torapi
-npm install --no-progress --save-exact torapi@0.5.2 cheerio@1.0.0
+install -m 0644 "$ROOT/deploy/torapi-package.json" package.json
+if [ -f "$ROOT/deploy/torapi-package-lock.json" ]; then
+    install -m 0644 "$ROOT/deploy/torapi-package-lock.json" package-lock.json
+    npm ci --no-progress
+else
+    npm install --no-progress
+fi
 # Upstream has no bind-address option. Pin the single listener to loopback.
 python3 - <<'PY'
 from pathlib import Path
