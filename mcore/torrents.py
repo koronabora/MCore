@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+import math
 import libtorrent as lt
 from .network import session_settings, validate_torrent
 
@@ -75,6 +76,7 @@ class Torrents:
         self.handles = {}
         self.active = {}
         self.errors = {}
+        self.media_info = {}
         self.last_used = {}
         self.lock = asyncio.Lock()
         with store.connect() as db:
@@ -167,7 +169,7 @@ class Torrents:
             raise ValueError('Unsafe torrent file path')
         return handle, info, path, files.file_size(index), files.file_offset(index)
 
-    def status(self, key, index=0, seconds=15):
+    def status(self, key, index=0, seconds=15, position=0):
         handle = self.handles[key]
         self.last_used[key] = time.monotonic()
         status = handle.status()
@@ -177,23 +179,31 @@ class Torrents:
                   'error': self.errors.get(key) or (str(status.errc.message()) if status.errc.value() else None)}
         if status.has_metadata:
             _, info, _, size, offset = self.file(key, index)
-            # Conservative estimate until ffprobe supplies actual duration/bitrate.
-            target = min(size, max(4*1024*1024, seconds*1024*1024))
-            first, last = offset // info.piece_length(), (offset+target-1) // info.piece_length()
-            missing = sum(info.piece_size(i) for i in range(first, last+1) if not handle.have_piece(i))
-            for i in range(first, last+1):
-                if not handle.have_piece(i):
-                    handle.set_piece_deadline(i, (i-first)*50)
+            metadata = self.media_info.get((key, index), {})
+            duration = metadata.get('duration_ms', 0)/1000
+            # Duration comes from the container, not a fixed bytes-per-second guess.
+            # VBR needs a margin; actual decoder reads remain authoritative after seeking.
+            rate = size/duration if duration else 1024*1024
+            start = max(0, min(size-1, int(max(0, position/1000-2)*rate))) if duration else 0
+            target = min(size-start, max(1024*1024, math.ceil((seconds+2)*rate*1.25)) if duration else max(4*1024*1024, seconds*1024*1024))
+            first, last = (offset+start)//info.piece_length(), (offset+start+target-1)//info.piece_length()
+            wanted = set(range(first, last+1))
+            # Header pieces are also required for a resumed decoder to reopen the container.
+            wanted.update(range(offset//info.piece_length(), (offset+min(size, 1024*1024)-1)//info.piece_length()+1))
             # AVI/OpenDML and MP4 indexes can span several pieces, not just the last one.
             tail_first = (offset+max(0, size-8*1024*1024)) // info.piece_length()
             tail_last = (offset+size-1) // info.piece_length()
-            for tail in range(max(last+1, tail_first), tail_last+1):
-                if size and not handle.have_piece(tail):
-                    handle.set_piece_deadline(tail, 0)
-                    missing += info.piece_size(tail)
-            result['ready'] = missing == 0 and size > 0
+            wanted.update(range(tail_first, tail_last+1))
+            missing = 0
+            for piece in sorted(wanted):
+                if size and not handle.have_piece(piece):
+                    handle.set_piece_deadline(piece, 0)
+                    missing += info.piece_size(piece)
+            result['ready'] = missing == 0 and size > 0 and (position == 0 or duration > 0)
             result['buffer_eta'] = round(missing / status.download_payload_rate) if status.download_payload_rate else None
             result['file_size'] = size
+            result.update(buffer_basis='average_bitrate' if duration else 'fallback', duration_ms=metadata.get('duration_ms'),
+                          buffer_position=position, buffer_bytes=target, buffer_missing_bytes=missing, media=metadata or None)
         return result
 
     async def stream(self, key, index, start, end):

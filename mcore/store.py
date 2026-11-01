@@ -23,6 +23,15 @@ class Store:
                 CREATE TABLE IF NOT EXISTS releases (id TEXT PRIMARY KEY, movie TEXT, data TEXT, updated REAL);
                 CREATE INDEX IF NOT EXISTS releases_movie ON releases(movie);
                 CREATE TABLE IF NOT EXISTS torrents (id TEXT PRIMARY KEY, magnet TEXT, added REAL, size INTEGER DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS media_info (torrent TEXT, file INTEGER, data TEXT, PRIMARY KEY(torrent,file));
+                CREATE TABLE IF NOT EXISTS episode_files (release TEXT, torrent TEXT, file INTEGER, movie TEXT, episode TEXT, season INTEGER, number INTEGER, name TEXT, PRIMARY KEY(torrent,file));
+                CREATE INDEX IF NOT EXISTS episode_movie ON episode_files(movie);
+                CREATE TABLE IF NOT EXISTS episode_history (user TEXT, movie TEXT, episode TEXT, position INTEGER, duration INTEGER, completed INTEGER, torrent TEXT, file INTEGER, updated REAL, PRIMARY KEY(user,movie,episode));
+                CREATE TABLE IF NOT EXISTS sync_jobs (id TEXT PRIMARY KEY, kind TEXT, provider TEXT, payload TEXT, due REAL, attempts INTEGER DEFAULT 0, error TEXT DEFAULT '', completed REAL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT);
+                CREATE INDEX IF NOT EXISTS sync_due ON sync_jobs(kind,due);
+                CREATE TABLE IF NOT EXISTS title_links (alias TEXT, kind TEXT, year TEXT, movie TEXT, PRIMARY KEY(alias,kind,year,movie));
+                CREATE INDEX IF NOT EXISTS title_movie ON title_links(movie);
             ''')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(history)')}
             for name, kind in [('torrent', 'TEXT'), ('file', 'INTEGER')]:

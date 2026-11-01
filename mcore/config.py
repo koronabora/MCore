@@ -19,5 +19,9 @@ def load():
     if not isinstance(providers, list) or any(p not in ('rutracker', 'kinozal') for p in providers):
         raise ValueError('Supported providers: rutracker, kinozal')
     config['providers'] = list(dict.fromkeys(providers))
+    config.setdefault('archive_enabled', True)
+    config.setdefault('sync_request_delay', 3)
+    if type(config['archive_enabled']) is not bool or not 1 <= config['sync_request_delay'] <= 300:
+        raise ValueError('Invalid archive or synchronization settings')
     Path(config['state_dir']).mkdir(parents=True, exist_ok=True, mode=0o700)
     return config

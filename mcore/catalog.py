@@ -25,11 +25,11 @@ def title_key(value):
     return re.sub(r'\W+', ' ', unicodedata.normalize('NFKC', value).casefold().replace('ё', 'е')).strip()
 
 
-SEASON = re.compile(r'(?i)\b(?:s(\d{1,3}(?:-\d{1,3})?)(?:e\d+)?|(?:сезоны?|seasons?)\s*[: .-]*([\d,-]+)|(\d{1,2})x\d+|сери[ияй]\s*[: .-]*\d+)')
+SEASON = re.compile(r'(?i)\b(?:s(\d{1,3}(?:-\d{1,3})?)(?:e\d+)?|(\d{1,3}(?:-\d{1,3})?)\s*сезон\w*|(?:сезоны?|seasons?)\s*[: .-]*([\d,-]+)|(\d{1,2})x\d+|сери[ияй]\s*[: .-]*\d+)')
 
 
 def video_title(title):
-    return not re.search(r'(?i)\b(?:ArtBook|Wallpapers?|OST|Soundtrack)\b|\[(?:JPG|PNG|BMP)(?:[/,\s\w]*)\]|Anime Creditless|Fan-Made Trailer|[,\[]\s*трейлер\b|русский фан-ролик', title)
+    return not re.search(r'(?i)\b(?:ArtBook|Wallpapers?|OST|Soundtrack)\b|\[(?:JPG|PNG|BMP|PDF|EPUB|MP3|FLAC)(?:[/,\s\w]*)\]|Anime Creditless|Fan-Made Trailer|[,\[]\s*трейлер\b|русский фан-ролик', title)
 
 
 def normalize(provider, row):
@@ -53,7 +53,7 @@ def normalize(provider, row):
         aliases = bilingual
     # Preserve alternate-language titles for exact search, without treating every query as exact.
     before_year = re.split(r'[\[(]|\b(?:19|20)\d{2}\b', title_part)[0]
-    for part in before_year.split('/')[:3]:
+    for part in before_year.split('/')[:8]:
         alias = re.split(r'[\[(]', part)[0].strip(' -./')
         if alias and alias not in aliases:
             aliases.append(alias)
@@ -69,7 +69,7 @@ def normalize(provider, row):
     resolution = re.search(r'\b(2160|1080|720|576|480)[piр]?\b', title, re.I)
     dimensions = re.search(r'\b\d{3,4}\s*[xх×]\s*(\d{3,4})\b', title, re.I)
     source = re.search(r'(?i)\b(?:UHD\s*BDRemux|BDRemux|BDRip|Blu-?Ray(?:\s*Remux)?|WEB-?DL|WEBRip|HDRip|HDTV|DVDRip|DVD[-59]?|CAMRip|TS)\b', title)
-    return {'id': provider + ':' + rid, 'movie': hashlib.sha256(identity.encode()).hexdigest()[:24], 'parser_version': 5,
+    return {'id': provider + ':' + rid, 'movie': hashlib.sha256(identity.encode()).hexdigest()[:24], 'parser_version': 6,
             'title_aliases': aliases,
             'provider': provider, 'source_id': rid, 'title': clean, 'release_title': title,
             'year': year[0] if year else '', 'director': '', 'description': '', 'poster': '',
@@ -96,12 +96,12 @@ class Catalog:
             existing = [json.loads(row['data']) for row in db.execute('SELECT data FROM releases')]
             # Reindex as one transaction; thousands of individual fsyncs delay API startup.
             for old in existing:
-                if not self.enabled(old) or old['provider'] == 'local' or old.get('parser_version') == 5:
+                if not self.enabled(old) or old['provider'] == 'local' or old.get('parser_version') == 6:
                     continue
                 parsed = normalize(old['provider'], {'Id': old['source_id'], 'Title': old['release_title']})
                 if parsed:
                     updated = old | {k: parsed[k] for k in ('movie', 'title', 'resolution', 'series', 'season', 'title_aliases')}
-                    updated['parser_version'] = 5
+                    updated['parser_version'] = 6
                     self.put(updated, db)
 
     async def close(self):
@@ -118,17 +118,44 @@ class Catalog:
             prior = db.execute('SELECT data FROM releases WHERE id=?', (item['id'],)).fetchone()
             if prior:
                 old = json.loads(prior['data'])
+                if item['movie'] in old.get('movie_aliases', []):
+                    item['movie'] = old['movie']
                 item['movie_aliases'] = list(dict.fromkeys(old.get('movie_aliases', []) + [old['movie']]))
                 item['search_queries'] = list(dict.fromkeys(item.get('search_queries', []) + old.get('search_queries', [])))[:16]
                 for field in ('director', 'description', 'poster', 'magnet', 'audio', 'screenshots'):
                     item[field] = item.get(field) or old.get(field, '')
-                for field in ('metadata_at', 'dimensions', 'torrent_id'):
+                for field in ('metadata_at', 'dimensions', 'torrent_id', 'external_ids', 'screenshots_at'):
                     if field not in item and field in old:
                         item[field] = old[field]
                 if item.get('dimensions') and 'не указано' in item['resolution']:
                     item['resolution'] = item['dimensions']
+            before = item['movie']
+            kind = 'anime' if re.search(r'(?i)\[TV\]|\bаниме\b|сёнэн', item['release_title']) else 'series' if item.get('series') else 'film'
+            year = item.get('year', '') if kind == 'film' else ''
+            aliases = {title_key(a) for a in item.get('title_aliases', [])+[item['title']] if a}
+            ids = item.get('external_ids', {})
+            strong = {f'{source}:{value}' for source, value in ids.items() if source in ('imdb', 'kinopoisk') and value}
+            candidates = set()
+            for alias in strong or (aliases if year and not prior else set()):
+                candidates.update(r['movie'] for r in db.execute('SELECT movie FROM title_links WHERE alias=? AND kind=? AND year=?', (alias, kind, '' if strong else year)))
+            if len(candidates) == 1:
+                target = next(iter(candidates))
+                others = [json.loads(r['data']) for r in db.execute('SELECT data FROM releases WHERE movie=? LIMIT 100', (target,))]
+                conflict = any(any(k in other.get('external_ids', {}) and other['external_ids'][k] != v for k, v in ids.items()) for other in others)
+                if not conflict:
+                    item['movie'] = target
+            elif not candidates and strong:
+                item['movie'] = hashlib.sha256((kind+':'+sorted(strong)[0]).encode()).hexdigest()[:24]
+            if before != item['movie']:
+                item['movie_aliases'] = list(dict.fromkeys(item.get('movie_aliases', [])+[before]))
             db.execute('INSERT OR REPLACE INTO releases VALUES (?,?,?,?)',
                        (item['id'], item['movie'], json.dumps(item, ensure_ascii=False), time.time()))
+            for alias in aliases:
+                db.execute('INSERT OR IGNORE INTO title_links VALUES (?,?,?,?)', (alias, kind, year, item['movie']))
+            for alias in strong:
+                db.execute('INSERT OR IGNORE INTO title_links VALUES (?,?,?,?)', (alias, kind, '', item['movie']))
+            if prior and old['movie'] != item['movie'] and not db.execute('SELECT 1 FROM releases WHERE movie=? LIMIT 1', (old['movie'],)).fetchone():
+                db.execute('DELETE FROM title_links WHERE movie=?', (old['movie'],))
 
     async def provider_search(self, provider, query):
         if provider not in self.config['providers']:
@@ -163,7 +190,7 @@ class Catalog:
 
     def movies(self, query=''):
         with self.store.connect() as db:
-            rows = db.execute('SELECT data FROM releases ORDER BY updated DESC LIMIT 20000').fetchall()
+            rows = db.execute('SELECT data FROM releases ORDER BY updated DESC').fetchall()
         grouped = {}
         for row in rows:
             item = json.loads(row['data'])
@@ -293,38 +320,19 @@ class Catalog:
                 'swarm_refresh_failed': failed,
                 'aliases': list({mid, *(a for i in items for a in i.get('movie_aliases', []) if a), *(i['movie'] for i in items)})}
 
+    async def enrich(self, movies):
+        async def one(movie):
+            releases = self.movie_releases(movie['id'])
+            if any(r.get('description') and r.get('director') and r.get('poster') for r in releases):
+                return
+            best = sorted(releases, key=lambda r: (r['provider'] != 'kinozal', -r.get('seeds', 0)))
+            if best:
+                try:
+                    await asyncio.wait_for(self.detail(best[0]['id']), 8)
+                except TimeoutError:
+                    pass
+        await asyncio.gather(*(one(movie) for movie in movies[:4]))
+
     async def synchronize(self):
-        while True:
-            started = time.monotonic()
-            try:
-                with self.store.connect() as db:
-                    queries = [r['query'] for r in db.execute('SELECT DISTINCT query FROM queries')]
-                    releases = [item['id'] for r in db.execute('SELECT data FROM releases ORDER BY updated')
-                                if (item := json.loads(r['data']))['provider'] in self.config['providers']]
-                    known = {(item['provider'], item['title']) for item in
-                             (json.loads(r['data']) for r in db.execute('SELECT data FROM releases'))
-                             if item['provider'] in self.config['providers']}
-                for provider in self.config['providers']:
-                    if self.jackett:
-                        await self.provider_search(provider, '')
-                        continue
-                    try:
-                        response = await self.client.get('/api/get/rss/' + provider, headers={'Accept': 'application/json'})
-                        response.raise_for_status()
-                        for row in response.json():
-                            item = normalize(provider, row)
-                            if item:
-                                self.put(item)
-                    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
-                        log.warning('RSS unavailable: %s', provider)
-                for query in queries:
-                    await asyncio.gather(*(self.provider_search(p, query) for p in self.config['providers']))
-                pairs = list(known)
-                for offset in range(0, len(pairs), 4):
-                    await asyncio.gather(*(self.provider_search(p, q) for p, q in pairs[offset:offset+4]))
-                for offset in range(0, len(releases), 4):
-                    await asyncio.gather(*(self.detail(rid) for rid in releases[offset:offset+4]))
-                self.sync_status = {'completed_at': time.time(), 'known_refreshed': len(releases)}
-            except Exception:
-                log.exception('Background index refresh failed')
-            await asyncio.sleep(max(60, self.config['sync_seconds']-(time.monotonic()-started)))
+        from .sync import Synchronizer
+        await Synchronizer(self).run()

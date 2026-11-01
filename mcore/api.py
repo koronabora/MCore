@@ -16,6 +16,7 @@ from .catalog import Catalog
 from .torrents import Torrents, byte_range
 from .images import image_bytes
 from .inspection import Inspection
+from . import episodes
 
 
 @asynccontextmanager
@@ -30,11 +31,12 @@ async def lifespan(app):
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    await app.state.inspection.close()
     await app.state.catalog.close()
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.2.1', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -97,6 +99,8 @@ async def search(q: str = Query(min_length=1, max_length=150), live: bool = True
         with app.state.store.connect() as db:
             db.execute('INSERT OR REPLACE INTO queries VALUES (?,?,?)', (uid, q, time.time()))
     errors = await asyncio.gather(*(catalog.provider_search(p, q) for p in catalog.config['providers'])) if live else []
+    if live:
+        await catalog.enrich(catalog.movies(q))
     return {'movies': catalog.movies(q), 'unavailable_providers': [e for e in errors if e]}
 
 
@@ -112,6 +116,7 @@ async def movie(mid: str, uid=Depends(user)):
     result['resume'] = {'torrent': row['torrent'], 'file': row['file']} if row and row['torrent'] else None
     if result['resume']:
         result['resume']['release'] = next((i['id'] for i in app.state.catalog.movie_releases(mid) if i.get('torrent_id') == row['torrent']), '')
+    result['episodes'] = episodes.listing(app.state.store, aliases, uid)
     return result
 
 
@@ -168,11 +173,20 @@ async def poster(mid: str, uid=Depends(user)):
 async def screenshot(rid: str, index: int, uid=Depends(user)):
     if not 0 <= index <= 2:
         raise HTTPException(404, 'Screenshot not found')
-    release = app.state.catalog.release(rid)
+    release = await app.state.catalog.detail(rid)
     if not release:
         raise HTTPException(404, 'Release not found')
     try:
         sources = release.get('screenshots') or []
+        if not sources and release['provider'] == 'kinozal' and app.state.catalog.metadata:
+            lock = app.state.catalog.detail_locks.setdefault('screens:'+rid, asyncio.Lock())
+            async with lock:
+                release = app.state.catalog.release(rid)
+                if release.get('screenshots_at', 0) < time.time()-900:
+                    release['screenshots'] = await app.state.catalog.metadata.screenshots('kinozal', release['source_id'])
+                    release['screenshots_at'] = time.time()
+                    app.state.catalog.put(release)
+                sources = release.get('screenshots') or []
         if index < len(sources):
             content, media_type = await image_bytes(sources[index])
         else:
@@ -194,13 +208,26 @@ class Position(BaseModel):
     position: int = Field(ge=0, le=604800000)
     torrent: str | None = Field(default=None, pattern=r'^[a-f0-9]{40,64}$')
     file: int | None = Field(default=None, ge=0)
+    episode: str | None = Field(default=None, max_length=150)
+    duration: int = Field(default=0, ge=0, le=604800000)
+    completed: bool = False
 
 
 @app.put('/v1/history/{mid}')
 def history(mid: str, body: Position, uid=Depends(user)):
     with app.state.store.connect() as db:
-        if not app.state.catalog.movie_releases(mid):
+        releases = app.state.catalog.movie_releases(mid)
+        if not releases:
             raise HTTPException(404, 'Movie not found')
+        mapping = db.execute('SELECT * FROM episode_files WHERE torrent=? AND file=?', (body.torrent, body.file)).fetchone()
+        episode = body.episode or (mapping['episode'] if mapping else None)
+        if episode:
+            if not mapping or mapping['episode'] != episode or mapping['release'] not in {r['id'] for r in releases}:
+                raise HTTPException(400, 'Episode does not belong to this movie/file')
+            db.execute('''INSERT INTO episode_history VALUES (?,?,?,?,?,?,?,?,?)
+                          ON CONFLICT(user,movie,episode) DO UPDATE SET position=excluded.position,duration=excluded.duration,
+                          completed=excluded.completed,torrent=excluded.torrent,file=excluded.file,updated=excluded.updated''',
+                       (uid, releases[0]['movie'], episode, body.position, body.duration, int(body.completed), body.torrent, body.file, time.time()))
         db.execute('''INSERT INTO history(user,movie,position,updated,torrent,file) VALUES (?,?,?,?,?,?)
                       ON CONFLICT(user,movie) DO UPDATE SET position=excluded.position,updated=excluded.updated,
                       torrent=COALESCE(excluded.torrent,history.torrent),file=COALESCE(excluded.file,history.file)''',
@@ -218,6 +245,9 @@ async def start(body: Start, uid=Depends(user)):
     if not release:
         raise HTTPException(404, 'Release not found')
     try:
+        if app.state.catalog.jackett and not release.get('download') and not release.get('magnet'):
+            await app.state.catalog.provider_search(release['provider'], release['title'])
+            release = app.state.catalog.release(body.release)
         source = release['magnet']
         if app.state.catalog.jackett and release.get('download'):
             source = await app.state.catalog.jackett.download(release['download'])
@@ -232,9 +262,26 @@ async def start(body: Start, uid=Depends(user)):
 
 
 @app.get('/v1/torrents/{key}')
-def status(key: str, file: int = Query(default=0, ge=0), buffer: int = Query(default=15, ge=1, le=120), uid=Depends(user)):
+async def status(key: str, file: int = Query(default=0, ge=0), buffer: int = Query(default=15, ge=1, le=120), position: int = Query(default=0, ge=0, le=604800000), uid=Depends(user)):
     try:
-        return app.state.torrents.status(key, file, buffer)
+        result = app.state.torrents.status(key, file, buffer, position)
+        if result['files']:
+            app.state.inspection.schedule(key, file)
+            with app.state.store.connect() as db:
+                rows = db.execute("SELECT data FROM releases WHERE json_extract(data,'$.torrent_id')=?", (key,)).fetchall()
+            for row in rows:
+                release = json.loads(row['data'])
+                episodes.register(app.state.store, release, key, result['files'])
+            with app.state.store.connect() as db:
+                for item in result['files']:
+                    mapping = db.execute('SELECT * FROM episode_files WHERE torrent=? AND file=?', (key, item['index'])).fetchone()
+                    if mapping:
+                        item.update(episode=mapping['episode'], season=mapping['season'], number=mapping['number'])
+                        related = app.state.catalog.movie_releases(mapping['movie'])
+                        aliases = list({mapping['movie'], *(r['movie'] for r in related), *(a for r in related for a in r.get('movie_aliases', []))})
+                        saved = db.execute('SELECT * FROM episode_history WHERE user=? AND episode=? AND movie IN ('+','.join('?' for _ in aliases)+') ORDER BY updated DESC LIMIT 1', (uid, mapping['episode'], *aliases)).fetchone()
+                        item.update(position=saved['position'] if saved else 0, completed=bool(saved['completed']) if saved else False)
+        return result
     except KeyError:
         raise HTTPException(404, 'Torrent not found')
     except ValueError as error:

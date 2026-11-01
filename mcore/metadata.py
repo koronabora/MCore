@@ -41,8 +41,23 @@ def parse_detail(provider, html, url):
     video = field('Видео')
     dimensions = re.search(r'\b(\d{3,4})\s*[xх×]\s*(\d{3,4})\b', video)
     title = soup.select_one('#topic-title' if provider == 'rutracker' else 'h1')
+    identifiers = {}
+    for link in root.select('a[href]'):
+        href = link.get('href', '')
+        imdb = re.search(r'imdb\.com/title/(tt\d+)', href)
+        kp = re.search(r'kinopoisk\.ru/(?:film|series)/(\d+)', href)
+        if imdb:
+            identifiers['imdb'] = imdb[1]
+        if kp:
+            identifiers['kinopoisk'] = kp[1]
+    if provider == 'kinozal':
+        for img in root.select('a[href] img'):
+            src = img.get('src', '')
+            if src.startswith(('http://', 'https://')) and src not in pictures:
+                pictures.append(src)
     return {'description': description[:12000], 'director': field('Режисс[её]р')[:500],
-            'poster': poster, 'screenshots': pictures[1:4], 'audio': field('Аудио')[:1500],
+            'poster': poster, 'screenshots': [p for p in pictures if p != poster][:3], 'audio': field('Аудио')[:1500],
+            'external_ids': identifiers,
             'dimensions': dimensions[0] if dimensions else '',
             'detail_title': title.get_text('', strip=True) if title else ''}
 
@@ -57,11 +72,29 @@ class Metadata:
     async def detail(self, provider, rid):
         if provider not in self.sites or not str(rid).isdigit():
             raise ValueError('Invalid tracker detail')
-        url = self.sites[provider] + ('/details.php?id=' if provider == 'kinozal' else '/forum/viewtopic.php?t=') + str(rid)
+        path = ('/details.php?id=' if provider == 'kinozal' else '/forum/viewtopic.php?t=') + str(rid)
+        return parse_detail(provider, await self.html(provider, path), self.sites[provider]+path)
+
+    async def html(self, provider, path):
+        url = self.sites[provider] + path
         async with self.limit:
             response = await self.client.post(self.url, json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000})
             response.raise_for_status()
             data = response.json()
         if data.get('status') != 'ok':
             raise ValueError('Tracker detail unavailable')
-        return parse_detail(provider, data['solution']['response'], url)
+        return data['solution']['response']
+
+    async def screenshots(self, provider, rid):
+        if provider != 'kinozal' or not str(rid).isdigit():
+            return []
+        html = await self.html(provider, '/get_srv_details.php?id='+str(rid)+'&pagesd=2')
+        soup = BeautifulSoup(html, 'html.parser')
+        pictures = []
+        for img in soup.select('img[src]'):
+            parent = img.find_parent('a')
+            full = parent.get('href', '') if parent else ''
+            src = full if re.search(r'(?i)\.(?:jpg|jpeg|png|webp)(?:\?|$)', full) else img['src']
+            if src.startswith(('http://', 'https://', '//')):
+                pictures.append(urljoin(self.sites[provider], src))
+        return list(dict.fromkeys(pictures))[:3]
