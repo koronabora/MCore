@@ -118,6 +118,9 @@ class Catalog:
             for dest, source in [('description', 'Description'), ('director', 'Directer'),
                                  ('poster', 'Poster'), ('audio', 'Audio'), ('magnet', 'Magnet')]:
                 item[dest] = row.get(source) or item.get(dest, '')
+            screenshots = row.get('Screenshots')
+            if isinstance(screenshots, list):
+                item['screenshots'] = [s for s in screenshots if isinstance(s, str)][:3]
             if not item['magnet'] and re.fullmatch('[a-fA-F0-9]{40}', str(row.get('Hash', ''))):
                 item['magnet'] = 'magnet:?xt=urn:btih:' + row['Hash']
             # Detail responses do not always contain swarm counters; do not invent them.
@@ -146,10 +149,14 @@ class Catalog:
 
     async def synchronize(self):
         while True:
+            started = time.monotonic()
             try:
                 with self.store.connect() as db:
-                    queries = [r['query'] for r in db.execute('SELECT DISTINCT query FROM queries LIMIT 1000')]
-                    releases = [r['id'] for r in db.execute('SELECT id FROM releases ORDER BY updated LIMIT 1000')]
+                    queries = [r['query'] for r in db.execute('SELECT DISTINCT query FROM queries')]
+                    releases = [r['id'] for r in db.execute('SELECT id FROM releases ORDER BY updated')]
+                    known = {(item['provider'], item['title']) for item in
+                             (json.loads(r['data']) for r in db.execute('SELECT data FROM releases'))
+                             if item['provider'] in self.config['providers']}
                 for provider in self.config['providers']:
                     try:
                         response = await self.client.get('/api/get/rss/' + provider, headers={'Accept': 'application/json'})
@@ -162,9 +169,12 @@ class Catalog:
                         log.warning('RSS unavailable: %s', provider)
                 for query in queries:
                     await asyncio.gather(*(self.provider_search(p, query) for p in self.config['providers']))
-                for rid in releases:
-                    await self.detail(rid)
+                pairs = list(known)
+                for offset in range(0, len(pairs), 4):
+                    await asyncio.gather(*(self.provider_search(p, q) for p, q in pairs[offset:offset+4]))
+                for offset in range(0, len(releases), 4):
+                    await asyncio.gather(*(self.detail(rid) for rid in releases[offset:offset+4]))
                 self.sync_status = {'completed_at': time.time(), 'known_refreshed': len(releases)}
             except Exception:
                 log.exception('Background index refresh failed')
-            await asyncio.sleep(self.config['sync_seconds'])
+            await asyncio.sleep(max(60, self.config['sync_seconds']-(time.monotonic()-started)))
