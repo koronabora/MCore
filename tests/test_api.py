@@ -83,6 +83,18 @@ def test_torrent_file_preserves_private_flag_and_metadata(client, tmp_path):
     assert lt.torrent_info(stored.read_bytes()).priv()
 
 
+def test_verified_range_limits_and_unavailable_data(client, monkeypatch):
+    auth = login(client, 'verified')
+    monkeypatch.setattr(app.state.torrents, 'file', lambda *_: (None, None, None, 8*1024*1024, 0))
+    async def unavailable(*args):
+        raise TimeoutError('Unavailable')
+        yield b''
+    monkeypatch.setattr(app.state.torrents, 'stream', unavailable)
+    path = '/v1/torrents/test/files/0'
+    assert client.get(path, headers=auth | {'Range': 'bytes=0-4194304', 'X-MCore-Integrity': 'sha256'}).status_code == 400
+    assert client.get(path, headers=auth | {'Range': 'bytes=0-1023', 'X-MCore-Integrity': 'sha256'}).status_code == 503
+
+
 def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypatch):
     auth = login(client, 'streamer')
     source = tmp_path/'seed'
@@ -134,6 +146,15 @@ def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypat
         assert response.content == payload[16380:16401]
         response = client.get(path, headers=auth | {'Range': 'bytes=-100'})
         assert response.content == payload[-100:]
+        verified = client.get(path, headers=auth | {'Range': 'bytes=16380-16400', 'X-MCore-Integrity': 'sha256'})
+        assert verified.status_code == 206
+        assert verified.headers['content-range'] == f'bytes 16380-16400/{len(payload)}'
+        assert verified.content == payload[16380:16401]
+        assert verified.headers['x-mcore-sha256'] == hashlib.sha256(verified.content).hexdigest()
+        assert client.get(path, headers=auth | {'X-MCore-Integrity': 'sha256'}).status_code == 400
+        assert client.get(path, headers=auth | {'Range': 'bytes=0-10', 'X-MCore-Integrity': 'crc32'}).status_code == 400
+        tail = client.get(path, headers=auth | {'Range': 'bytes=-100', 'X-MCore-Integrity': 'sha256'})
+        assert tail.headers['x-mcore-sha256'] == hashlib.sha256(payload[-100:]).hexdigest()
         assert client.get(path, headers=auth | {'Range': f'bytes={len(payload)}-'}).status_code == 416
         whole = client.get(path, headers=auth)
         assert hashlib.sha256(whole.content).digest() == hashlib.sha256(payload).digest()

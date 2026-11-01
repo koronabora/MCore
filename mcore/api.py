@@ -2,6 +2,7 @@ import asyncio
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 import json
+import hashlib
 import time
 import httpx
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
@@ -225,6 +226,22 @@ async def media(key: str, index: int, request: Request, uid=Depends(user)):
     headers = {'Accept-Ranges': 'bytes', 'Content-Length': str(end-start+1)}
     if code == 206:
         headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    integrity = request.headers.get('x-mcore-integrity')
+    if integrity is not None:
+        if integrity != 'sha256' or code != 206 or end-start+1 > 4*1024*1024:
+            raise HTTPException(400, 'SHA-256 requires a byte range of at most 4 MiB')
+        try:
+            content = bytearray()
+            async for chunk in app.state.torrents.stream(key, index, start, end):
+                content.extend(chunk)
+            if len(content) != end-start+1:
+                raise OSError('Incomplete range')
+        except (TimeoutError, OSError):
+            raise HTTPException(503, 'Verified range temporarily unavailable')
+        headers['X-MCore-SHA256'] = hashlib.sha256(content).hexdigest()
+        headers['Cache-Control'] = 'no-store'
+        return Response(content=b'' if request.method == 'HEAD' else bytes(content),
+                        status_code=code, headers=headers, media_type='application/octet-stream')
     if request.method == 'HEAD':
         return Response(status_code=code, headers=headers, media_type='application/octet-stream')
     return StreamingResponse(app.state.torrents.stream(key, index, start, end),
