@@ -10,3 +10,22 @@ torapi_url = "http://127.0.0.1:8443"
 tls_cert = "/etc/mcore/tls.crt"
 tls_key = "/etc/mcore/tls.key"
 providers = ["rutracker", "kinozal", "rutor", "nonameclub"]
+
+[torrent]
+# Forward this port to the server for BOTH TCP and UDP (uTP and DHT).
+# Keep the external and internal port identical. Independent of the HTTPS API.
+listen_port = 51413
+listen_addresses = ["0.0.0.0"] # Add "::" to also listen on IPv6.
+enable_dht = true
+enable_pex = true
+enable_utp = true
+enable_lsd = false
+# Prefer explicit forwarding; enable these only if automatic router mapping is wanted.
+enable_upnp = false
+enable_natpmp = false
+connections_limit = 200
+download_rate_limit = 0 # bytes/second; 0 = unlimited
+upload_rate_limit = 0   # bytes/second; 0 = unlimited
+# 0/0 lets the OS choose ephemeral source ports for outbound TCP peer connections.
+outgoing_port_first = 0
+outgoing_port_last = 0

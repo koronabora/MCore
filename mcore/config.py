@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import tomllib
+from .network import validate_torrent
 
 
 def load():
@@ -13,5 +14,6 @@ def load():
         raise ValueError('Invalid sync interval or cache capacity')
     if not config['public_url'].startswith('https://'):
         raise ValueError('HTTPS required')
+    config['torrent'] = validate_torrent(config.get('torrent', {}), config['port'])
     Path(config['state_dir']).mkdir(parents=True, exist_ok=True, mode=0o700)
     return config
