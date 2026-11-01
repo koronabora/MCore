@@ -1,0 +1,1 @@
+"""MCore: private media API."""
