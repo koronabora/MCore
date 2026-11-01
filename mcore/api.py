@@ -34,7 +34,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.2.1', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 

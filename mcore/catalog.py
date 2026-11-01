@@ -267,12 +267,15 @@ class Catalog:
         items = self.movie_releases(mid)
         if not items:
             return None
-        # Search refresh updates seed/peer counts which many detail endpoints omit.
-        if max(i.get('checked_at', 0) for i in items) < time.time()-900:
-            for provider in {i['provider'] for i in items}:
-                task = asyncio.create_task(self.provider_search(provider, items[0]['title']))
-                self.refresh_tasks.add(task)
-                task.add_done_callback(self.refresh_tasks.discard)
+        # Return the refreshed counters in this response, not in a discarded background task.
+        refresh_started = time.time()
+        async def refresh(provider):
+            try:
+                return await asyncio.wait_for(self.provider_search(provider, items[0]['title']), timeout=20)
+            except TimeoutError:
+                return provider
+        providers = {i['provider'] for i in items if i['provider'] in self.config['providers']}
+        failed = [p for p in await asyncio.gather(*(refresh(p) for p in providers)) if p]
         # One useful detail per card is enough for its poster and synopsis.
         if not any(i.get('description') and i.get('poster') for i in items):
             for item in sorted(items, key=lambda i: (i['provider'] != 'kinozal', -i.get('seeds', 0)))[:2]:
@@ -285,7 +288,9 @@ class Catalog:
         items = self.movie_releases(mid)
         best = max(items, key=lambda i: len(i.get('description', '')))
         return {'id': mid, **{k: best[k] for k in ('title', 'year', 'director', 'description')},
-                'releases': [self.public(i) for i in sorted(items, key=lambda i: (i.get('season', ''), -i.get('seeds', 0)))],
+                'releases': [self.public(i) | {'swarm_stale': i['provider'] != 'local' and i.get('checked_at', 0) < refresh_started}
+                             for i in sorted(items, key=lambda i: (i.get('season', ''), -i.get('seeds', 0)))],
+                'swarm_refresh_failed': failed,
                 'aliases': list({mid, *(a for i in items for a in i.get('movie_aliases', []) if a), *(i['movie'] for i in items)})}
 
     async def synchronize(self):

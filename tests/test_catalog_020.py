@@ -50,3 +50,33 @@ def test_tracker_details_extract_only_release_metadata():
         <p><b>О фильме:</b> Описание фильма.</p></div>''', 'https://kinozal.me/details.php?id=1')
     assert kz['poster'] == 'https://kinozal.me/i/poster.jpg'
     assert kz['description'] == 'Описание фильма.' and kz['director'] == 'Автор'
+
+
+def test_open_card_returns_new_swarm_counts_and_marks_missing_releases(tmp_path):
+    async def check():
+        catalog = Catalog(Store(tmp_path), {'providers': ['kinozal'], 'torapi_url': 'http://localhost:1'})
+        item = normalize('kinozal', {'Id': '1', 'Title': 'Example (2024) 1080p', 'Seeds': 1})
+        item.update(description='Synopsis', poster='https://example.org/poster.jpg', checked_at=0)
+        missing = dict(item, id='kinozal:2', source_id='2')
+        catalog.put(item); catalog.put(missing)
+        calls = []
+        async def refresh(provider, query):
+            calls.append((provider, query))
+            updated = dict(item, seeds=12, checked_at=__import__('time').time())
+            catalog.put(updated)
+        catalog.provider_search = refresh
+        try:
+            result = await catalog.movie(item['movie'])
+            by_id = {r['id']: r for r in result['releases']}
+            assert calls == [('kinozal', 'Example')]
+            assert by_id[item['id']]['seeds'] == 12 and not by_id[item['id']]['swarm_stale']
+            assert by_id[missing['id']]['swarm_stale']
+            async def unavailable(*_):
+                return 'kinozal'
+            catalog.provider_search = unavailable
+            result = await catalog.movie(item['movie'])
+            assert result['swarm_refresh_failed'] == ['kinozal']
+            assert all(r['swarm_stale'] for r in result['releases'])
+        finally:
+            await catalog.close()
+    asyncio.run(check())
