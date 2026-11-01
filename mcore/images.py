@@ -16,7 +16,7 @@ async def image_bytes(url):
             if not ips or any(not ip.is_global for ip in ips):
                 raise ValueError('Image host must resolve to public addresses')
             target = parsed.copy_with(host=str(ips[0]))
-            async with client.stream('GET', target, headers={'Host': parsed.netloc.decode(), 'User-Agent': 'MCore/0.1'},
+            async with client.stream('GET', target, headers={'Host': parsed.netloc.decode(), 'User-Agent': 'MCore/0.2.0'},
                                      extensions={'sni_hostname': parsed.host}) as response:
                 if response.is_redirect:
                     url = str(parsed.join(response.headers['location']))

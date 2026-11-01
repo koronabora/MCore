@@ -184,10 +184,13 @@ class Torrents:
             for i in range(first, last+1):
                 if not handle.have_piece(i):
                     handle.set_piece_deadline(i, (i-first)*50)
-            tail = (offset+size-1) // info.piece_length()
-            if size and not handle.have_piece(tail):
-                handle.set_piece_deadline(tail, 0)
-                missing += info.piece_size(tail)
+            # AVI/OpenDML and MP4 indexes can span several pieces, not just the last one.
+            tail_first = (offset+max(0, size-8*1024*1024)) // info.piece_length()
+            tail_last = (offset+size-1) // info.piece_length()
+            for tail in range(max(last+1, tail_first), tail_last+1):
+                if size and not handle.have_piece(tail):
+                    handle.set_piece_deadline(tail, 0)
+                    missing += info.piece_size(tail)
             result['ready'] = missing == 0 and size > 0
             result['buffer_eta'] = round(missing / status.download_payload_rate) if status.download_payload_rate else None
             result['file_size'] = size
@@ -203,7 +206,11 @@ class Torrents:
                 piece = (offset+cursor) // info.piece_length()
                 length = min(end-cursor+1, info.piece_length() - (offset+cursor) % info.piece_length(), 256*1024)
                 deadline = time.monotonic()+90
-                handle.set_piece_deadline(piece, 0)
+                # Read-ahead follows the player's current position, including after a seek.
+                ahead = min(info.num_pieces()-1, (offset+min(end, cursor+8*1024*1024)) // info.piece_length())
+                for upcoming in range(piece, ahead+1):
+                    if not handle.have_piece(upcoming):
+                        handle.set_piece_deadline(upcoming, (upcoming-piece)*50)
                 while not handle.have_piece(piece):
                     if time.monotonic() > deadline:
                         raise TimeoutError('Torrent piece unavailable')

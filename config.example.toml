@@ -35,6 +35,7 @@ outgoing_port_last = 0
 # [jackett]
 # url = "http://127.0.0.1:9117"
 # api_key_file = "/etc/mcore/jackett.key"
+# flaresolverr_url = "http://127.0.0.1:8191/v1"
 # [jackett.indexers]
 # rutracker = "rutracker"
 # kinozal = "kinozal-magnet"

@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ import unicodedata
 import httpx
 from rapidfuzz.fuzz import WRatio
 from .jackett import Jackett
+from .metadata import Metadata
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +21,17 @@ def number(value):
         return 0
 
 
+def title_key(value):
+    return re.sub(r'\W+', ' ', unicodedata.normalize('NFKC', value).casefold().replace('ё', 'е')).strip()
+
+
+SEASON = re.compile(r'(?i)\b(?:s(\d{1,3}(?:-\d{1,3})?)(?:e\d+)?|(?:сезоны?|seasons?)\s*[: .-]*([\d,-]+)|(\d{1,2})x\d+|сери[ияй]\s*[: .-]*\d+)')
+
+
+def video_title(title):
+    return not re.search(r'(?i)\b(?:ArtBook|Wallpapers?|OST|Soundtrack)\b|\[(?:JPG|PNG|BMP)(?:[/,\s\w]*)\]|Anime Creditless|Fan-Made Trailer|[,\[]\s*трейлер\b|русский фан-ролик', title)
+
+
 def normalize(provider, row):
     title = str(row.get('Title') or row.get('Name') or row.get('title') or '').strip()
     rid = str(row.get('Id') or row.get('id') or '')
@@ -26,18 +39,42 @@ def normalize(provider, row):
         link = str(row.get('link', ''))
         match = re.search(r'(?:[?&](?:t|id)=|/torrent/)(\d+)', link)
         rid = match[1] if match else ''
-    if not title or not rid:
+    if not title or not rid or not video_title(title):
         return None
     year = re.search(r'\b(?:19|20)\d{2}\b', str(row.get('Year') or title))
-    clean = re.split(r'\s*[\[(]|\s*/\s*|\b(?:19|20)\d{2}\b', title)[0].strip(' -./') or title
-    canonical = re.sub(r'\W+', ' ', unicodedata.normalize('NFKC', clean).casefold()).strip()
+    season = SEASON.search(title)
+    title_part = title[:season.start()] if season else title
+    title_part = re.sub(r"(?i)\((?:режисс[её]рская версия|director'?s cut|IMAX(?: Edition)?|extended(?: cut| edition)?)\)", '', title_part)
+    clean = re.split(r'\s*[\[(]|\s*/\s*|\b(?:19|20)\d{2}\b', title_part)[0].strip(' -./') or title
+    aliases = [clean]
+    bilingual = re.split(r'(?<=[а-яё])\s+(?=[A-Za-z])', clean, maxsplit=1, flags=re.I)
+    if len(bilingual) == 2 and re.search('[а-яё]', bilingual[0], re.I):
+        clean = bilingual[0].strip(' -./')
+        aliases = bilingual
+    # Preserve alternate-language titles for exact search, without treating every query as exact.
+    before_year = re.split(r'[\[(]|\b(?:19|20)\d{2}\b', title_part)[0]
+    for part in before_year.split('/')[:3]:
+        alias = re.split(r'[\[(]', part)[0].strip(' -./')
+        if alias and alias not in aliases:
+            aliases.append(alias)
+    translated = re.search(r'\)\s+/?\s*([A-Za-z][A-Za-z0-9 .:\'’-]+?)\s*[-/]*\s*$', title_part)
+    if translated:
+        aliases.append(translated[1].strip(' -/'))
+    original = next((a for a in aliases if re.search('[a-z]', a, re.I) and not re.search('[а-яё]', a, re.I)), clean)
+    canonical = title_key(original)
+    series = bool(season) or bool(re.search(r'(?i)\[TV\]|\bсериал\b', title))
+    anime = bool(re.search(r'(?i)\[TV\]|\bаниме\b|сёнэн', title))
     # Unknown year is deliberately not merged across sources.
-    identity = canonical + ':' + (year[0] if year else provider + ':' + rid)
-    resolution = re.search(r'\b(2160|1080|720|480)[pi]?\b', title)
-    return {'id': provider + ':' + rid, 'movie': hashlib.sha256(identity.encode()).hexdigest()[:24],
+    identity = canonical + ':' + ('anime-series' if series and anime else 'series' if series else year[0] if year else provider + ':' + rid)
+    resolution = re.search(r'\b(2160|1080|720|576|480)[piр]?\b', title, re.I)
+    dimensions = re.search(r'\b\d{3,4}\s*[xх×]\s*(\d{3,4})\b', title, re.I)
+    source = re.search(r'(?i)\b(?:UHD\s*BDRemux|BDRemux|BDRip|Blu-?Ray(?:\s*Remux)?|WEB-?DL|WEBRip|HDRip|HDTV|DVDRip|DVD[-59]?|CAMRip|TS)\b', title)
+    return {'id': provider + ':' + rid, 'movie': hashlib.sha256(identity.encode()).hexdigest()[:24], 'parser_version': 5,
+            'title_aliases': aliases,
             'provider': provider, 'source_id': rid, 'title': clean, 'release_title': title,
             'year': year[0] if year else '', 'director': '', 'description': '', 'poster': '',
-            'resolution': resolution[1] + 'p' if resolution else 'Original',
+            'resolution': resolution[1] + ('i' if resolution[0].lower().endswith('i') else 'p') if resolution else dimensions[0] if dimensions else '2160p' if re.search(r'(?i)\b(?:4K|UHD)\b', title) else source[0] + ' · разрешение не указано' if source else 'Разрешение не указано',
+            'series': series, 'season': next((g for g in season.groups() if g), '') if season else '',
             'size': str(row.get('Size') or row.get('size') or ''),
             'seeds': number(row.get('Seeds', row.get('seeds', 0))),
             'peers': number(row.get('Peers', row.get('peers', 0))),
@@ -52,20 +89,44 @@ class Catalog:
         self.limit = asyncio.Semaphore(4)
         self.sync_status = {}
         self.jackett = Jackett(config['jackett']) if config.get('jackett') else None
+        self.metadata = Metadata(config['jackett']) if self.jackett else None
+        self.detail_locks = {}
+        self.refresh_tasks = set()
+        with store.connect() as db:
+            existing = [json.loads(row['data']) for row in db.execute('SELECT data FROM releases')]
+            # Reindex as one transaction; thousands of individual fsyncs delay API startup.
+            for old in existing:
+                if not self.enabled(old) or old['provider'] == 'local' or old.get('parser_version') == 5:
+                    continue
+                parsed = normalize(old['provider'], {'Id': old['source_id'], 'Title': old['release_title']})
+                if parsed:
+                    updated = old | {k: parsed[k] for k in ('movie', 'title', 'resolution', 'series', 'season', 'title_aliases')}
+                    updated['parser_version'] = 5
+                    self.put(updated, db)
 
     async def close(self):
+        for task in self.refresh_tasks:
+            task.cancel()
+        await asyncio.gather(*self.refresh_tasks, return_exceptions=True)
         await self.client.aclose()
         if self.jackett:
             await self.jackett.client.aclose()
+            await self.metadata.client.aclose()
 
-    def put(self, item):
-        with self.store.connect() as db:
+    def put(self, item, connection=None):
+        with (nullcontext(connection) if connection is not None else self.store.connect()) as db:
             prior = db.execute('SELECT data FROM releases WHERE id=?', (item['id'],)).fetchone()
             if prior:
                 old = json.loads(prior['data'])
+                item['movie_aliases'] = list(dict.fromkeys(old.get('movie_aliases', []) + [old['movie']]))
                 item['search_queries'] = list(dict.fromkeys(item.get('search_queries', []) + old.get('search_queries', [])))[:16]
                 for field in ('director', 'description', 'poster', 'magnet', 'audio', 'screenshots'):
                     item[field] = item.get(field) or old.get(field, '')
+                for field in ('metadata_at', 'dimensions', 'torrent_id'):
+                    if field not in item and field in old:
+                        item[field] = old[field]
+                if item.get('dimensions') and 'не указано' in item['resolution']:
+                    item['resolution'] = item['dimensions']
             db.execute('INSERT OR REPLACE INTO releases VALUES (?,?,?,?)',
                        (item['id'], item['movie'], json.dumps(item, ensure_ascii=False), time.time()))
 
@@ -75,12 +136,14 @@ class Catalog:
         try:
             async with self.limit:
                 if self.jackett:
-                    for row in await self.jackett.search(provider, query):
-                        item = normalize(provider, row)
-                        if item:
-                            item.update(download=row['download'], description=row['description'], poster=row['poster'],
-                                        search_queries=[query.casefold()] if query else [])
-                            self.put(item)
+                    rows = await self.jackett.search(provider, query)
+                    with self.store.connect() as db:
+                        for row in rows:
+                            item = normalize(provider, row)
+                            if item:
+                                item.update(download=row['download'], description=row['description'], poster=row['poster'],
+                                            search_queries=[query.casefold()] if query else [])
+                                self.put(item, db)
                     return None
                 response = await self.client.get('/api/search/title/' + provider, params={'query': query})
                 if response.status_code == 400:
@@ -107,16 +170,24 @@ class Catalog:
             if not self.enabled(item):
                 continue
             score = WRatio(query.casefold(), item['title'].casefold()) if query else 100
+            exact = bool(query) and title_key(query) in {title_key(t) for t in item.get('title_aliases', []) + [item['title']]}
+            if exact:
+                score = 120 if title_key(query) == title_key(item['title']) else 100
             if query and query.casefold() in item.get('search_queries', []):
-                score = 100
+                score = max(score, 65)
             if query and score < 65:
                 continue
             mid = item['movie']
             if mid not in grouped:
                 grouped[mid] = {k: item[k] for k in ('title', 'year', 'director', 'description')}
-                grouped[mid].update(id=mid, releases=[], score=score)
+                grouped[mid].update(id=mid, releases=[], score=score, exact=exact, series=item.get('series', False))
+            grouped[mid]['score'] = max(grouped[mid]['score'], score)
+            grouped[mid]['exact'] |= exact
+            for field in ('description', 'director'):
+                if not grouped[mid][field] and item.get(field):
+                    grouped[mid][field] = item[field]
             grouped[mid]['releases'].append(self.public(item))
-        return sorted(grouped.values(), key=lambda m: -m['score'])[:100]
+        return sorted(grouped.values(), key=lambda m: (not m['exact'], -m['score'], m['series'], m['title']))[:100]
 
     @staticmethod
     def public(item):
@@ -129,12 +200,20 @@ class Catalog:
         return item if item and self.enabled(item) else None
 
     def enabled(self, item):
-        return item['provider'] == 'local' or item['provider'] in self.config['providers']
+        return item['provider'] == 'local' or (item['provider'] in self.config['providers'] and video_title(item.get('release_title', '')))
 
     def movie_releases(self, mid):
         with self.store.connect() as db:
-            rows = db.execute('SELECT data FROM releases WHERE movie=?', (mid,)).fetchall()
-        return [item for row in rows if self.enabled(item := json.loads(row['data']))]
+            items = [json.loads(row['data']) for row in db.execute('SELECT data FROM releases WHERE movie=?', (mid,))]
+            current = [i for i in items if self.enabled(i)]
+            if current:
+                return current
+            aliases = [json.loads(row['data']) for row in db.execute("SELECT data FROM releases WHERE EXISTS (SELECT 1 FROM json_each(releases.data, '$.movie_aliases') WHERE value=?)", (mid,))]
+            identities = {i['movie'] for i in aliases if self.enabled(i)}
+            if not identities:
+                return []
+            rows = db.execute('SELECT data FROM releases WHERE movie IN (' + ','.join('?' for _ in identities) + ')', tuple(identities))
+            return [i for row in rows if self.enabled(i := json.loads(row['data']))]
 
     async def detail(self, rid):
         item = self.release(rid)
@@ -143,6 +222,22 @@ class Catalog:
         if item['provider'] == 'local':
             return item
         if self.jackett:
+            if item.get('metadata_at', 0) < time.time()-86400:
+                lock = self.detail_locks.setdefault(rid, asyncio.Lock())
+                async with lock:
+                    item = self.release(rid)
+                    if item.get('metadata_at', 0) < time.time()-86400:
+                        try:
+                            item.update(await self.metadata.detail(item['provider'], item['source_id']))
+                            if item.get('detail_title'):
+                                parsed = normalize(item['provider'], {'Id': item['source_id'], 'Title': item.pop('detail_title')})
+                                if parsed:
+                                    for field in ('title', 'title_aliases', 'movie', 'series', 'season', 'release_title'):
+                                        item[field] = parsed[field]
+                            item['metadata_at'] = time.time()
+                        except (httpx.HTTPError, ValueError, KeyError):
+                            item['metadata_at'] = time.time()-86400+900
+                        self.put(item)
             return item
         try:
             async with self.limit:
@@ -173,12 +268,25 @@ class Catalog:
         if not items:
             return None
         # Search refresh updates seed/peer counts which many detail endpoints omit.
-        await asyncio.gather(*(self.provider_search(p, items[0]['title']) for p in {i['provider'] for i in items}))
-        await asyncio.gather(*(self.detail(item['id']) for item in items[:12]))
+        if max(i.get('checked_at', 0) for i in items) < time.time()-900:
+            for provider in {i['provider'] for i in items}:
+                task = asyncio.create_task(self.provider_search(provider, items[0]['title']))
+                self.refresh_tasks.add(task)
+                task.add_done_callback(self.refresh_tasks.discard)
+        # One useful detail per card is enough for its poster and synopsis.
+        if not any(i.get('description') and i.get('poster') for i in items):
+            for item in sorted(items, key=lambda i: (i['provider'] != 'kinozal', -i.get('seeds', 0)))[:2]:
+                try:
+                    detailed = await asyncio.wait_for(self.detail(item['id']), timeout=30)
+                except TimeoutError:
+                    continue
+                if detailed and detailed.get('description') and detailed.get('poster'):
+                    break
         items = self.movie_releases(mid)
         best = max(items, key=lambda i: len(i.get('description', '')))
         return {'id': mid, **{k: best[k] for k in ('title', 'year', 'director', 'description')},
-                'releases': [self.public(i) for i in items]}
+                'releases': [self.public(i) for i in sorted(items, key=lambda i: (i.get('season', ''), -i.get('seeds', 0)))],
+                'aliases': list({mid, *(a for i in items for a in i.get('movie_aliases', []) if a), *(i['movie'] for i in items)})}
 
     async def synchronize(self):
         while True:

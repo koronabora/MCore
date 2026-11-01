@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 import json
 import hashlib
 import time
+import re
+from pathlib import PurePath
 import httpx
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
@@ -32,7 +34,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.2.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -82,7 +84,7 @@ def pair(body: Pair):
 
 @app.get('/v1/health')
 def health(uid=Depends(user)):
-    return {'status': 'ok', 'service': 'MCore', 'sync': app.state.catalog.sync_status}
+    return {'status': 'ok', 'service': 'MCore', 'version': app.version, 'sync': app.state.catalog.sync_status}
 
 
 @app.get('/v1/search')
@@ -103,11 +105,26 @@ async def movie(mid: str, uid=Depends(user)):
     result = await app.state.catalog.movie(mid)
     if result is None:
         raise HTTPException(404, 'Movie not found')
+    aliases = result.get('aliases', [mid])
     with app.state.store.connect() as db:
-        row = db.execute('SELECT position,torrent,file FROM history WHERE user=? AND movie=?', (uid, mid)).fetchone()
+        row = db.execute('SELECT position,torrent,file FROM history WHERE user=? AND movie IN (' + ','.join('?' for _ in aliases) + ') ORDER BY updated DESC LIMIT 1', (uid, *aliases)).fetchone()
     result['position'] = row['position'] if row else 0
     result['resume'] = {'torrent': row['torrent'], 'file': row['file']} if row and row['torrent'] else None
+    if result['resume']:
+        result['resume']['release'] = next((i['id'] for i in app.state.catalog.movie_releases(mid) if i.get('torrent_id') == row['torrent']), '')
     return result
+
+
+@app.get('/v1/library/match')
+def match_saved(name: str = Query(min_length=1, max_length=500), uid=Depends(user)):
+    """Conservative catalog-only association for legacy files without a sidecar."""
+    stem = PurePath(name).stem.replace('.', ' ')
+    year = re.search(r'\b(?:19|20)\d{2}\b', stem)
+    title = re.split(r'(?i)[\[(]|\b(?:19|20)\d{2}\b|\bs\d{1,3}e\d+\b|\b\d{1,2}x\d+\b|\b(?:BDRip|WEB-DL|WEBRip|HDRip|1080p|720p|2160p)\b', stem)[0].strip(' -_')
+    if not title:
+        return {'movie': None}
+    choices = [m for m in app.state.catalog.movies(title) if m['exact'] and (not year or m['year'] == year[0])]
+    return {'movie': choices[0] if len(choices) == 1 else None}
 
 
 @app.get('/v1/home')
@@ -115,10 +132,15 @@ def home(uid=Depends(user)):
     with app.state.store.connect() as db:
         queries = [r['query'] for r in db.execute('SELECT query FROM queries WHERE user=? ORDER BY updated DESC LIMIT 8', (uid,))]
         history = []
+        seen = set()
         for row in db.execute('SELECT * FROM history WHERE user=? ORDER BY updated DESC LIMIT 30', (uid,)):
             releases = app.state.catalog.movie_releases(row['movie'])
             if releases:
                 item = releases[0]
+                identity = tuple(sorted(i['id'] for i in releases))
+                if identity in seen:
+                    continue
+                seen.add(identity)
                 history.append({'id': row['movie'], 'title': item['title'], 'year': item['year'], 'position': row['position']})
     return {'queries': queries, 'history': history}
 
@@ -127,6 +149,12 @@ def home(uid=Depends(user)):
 async def poster(mid: str, uid=Depends(user)):
     items = app.state.catalog.movie_releases(mid)
     url = next((item['poster'] for item in items if item.get('poster')), None)
+    if not url:
+        for item in sorted(items, key=lambda i: (i['provider'] != 'kinozal', -i.get('seeds', 0)))[:2]:
+            detail = await app.state.catalog.detail(item['id'])
+            if detail and detail.get('poster'):
+                url = detail['poster']
+                break
     if not url:
         raise HTTPException(404, 'Poster unavailable')
     try:
@@ -171,7 +199,7 @@ class Position(BaseModel):
 @app.put('/v1/history/{mid}')
 def history(mid: str, body: Position, uid=Depends(user)):
     with app.state.store.connect() as db:
-        if not db.execute('SELECT 1 FROM releases WHERE movie=?', (mid,)).fetchone():
+        if not app.state.catalog.movie_releases(mid):
             raise HTTPException(404, 'Movie not found')
         db.execute('''INSERT INTO history(user,movie,position,updated,torrent,file) VALUES (?,?,?,?,?,?)
                       ON CONFLICT(user,movie) DO UPDATE SET position=excluded.position,updated=excluded.updated,
@@ -194,6 +222,8 @@ async def start(body: Start, uid=Depends(user)):
         if app.state.catalog.jackett and release.get('download'):
             source = await app.state.catalog.jackett.download(release['download'])
         key = await app.state.torrents.add(source)
+        release['torrent_id'] = key
+        app.state.catalog.put(release)
     except httpx.HTTPError:
         raise HTTPException(502, 'Jackett download unavailable')
     except (ValueError, RuntimeError) as error:

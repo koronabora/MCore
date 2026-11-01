@@ -43,8 +43,10 @@ class Inspection:
         return self.info[identity]
 
     async def frame(self, release, index):
-        params = lt.parse_magnet_uri(release['magnet'])
-        key = str(params.info_hashes.get_best())
+        key = release.get('torrent_id')
+        if not key:
+            params = lt.parse_magnet_uri(release['magnet'])
+            key = str(params.info_hashes.get_best())
         files = self.torrents.files(key)
         if not files:
             raise ValueError('No cached video')

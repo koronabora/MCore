@@ -21,6 +21,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS history (user TEXT, movie TEXT, position INTEGER, updated REAL, PRIMARY KEY(user,movie));
                 CREATE TABLE IF NOT EXISTS queries (user TEXT, query TEXT, updated REAL, PRIMARY KEY(user,query));
                 CREATE TABLE IF NOT EXISTS releases (id TEXT PRIMARY KEY, movie TEXT, data TEXT, updated REAL);
+                CREATE INDEX IF NOT EXISTS releases_movie ON releases(movie);
                 CREATE TABLE IF NOT EXISTS torrents (id TEXT PRIMARY KEY, magnet TEXT, added REAL, size INTEGER DEFAULT 0);
             ''')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(history)')}

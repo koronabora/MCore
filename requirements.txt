@@ -3,3 +3,4 @@ uvicorn==0.38.0
 httpx==0.28.1
 rapidfuzz==3.14.3
 pytest==8.4.2
+beautifulsoup4==4.14.2
