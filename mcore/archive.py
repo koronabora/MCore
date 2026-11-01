@@ -6,6 +6,9 @@ from bs4 import BeautifulSoup
 
 def parse(provider, html, path):
     soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup.select('wbr'):
+        tag.unwrap()
+    soup.smooth()
     rows, links = [], set()
     query = parse_qs(urlparse(path).query)
     if provider == 'kinozal':
@@ -15,7 +18,7 @@ def parse(provider, html, path):
             a = tr.select_one('td.nam a[href^="/details.php?id="]')
             cells = tr.select('td')
             if a and len(cells) >= 6:
-                rows.append({'Id': parse_qs(urlparse(a['href']).query)['id'][0], 'Title': a.get_text('', strip=True),
+                rows.append({'Id': parse_qs(urlparse(a['href']).query)['id'][0], 'Title': re.sub(r'\s+', ' ', a.get_text()).strip(),
                              'Size': cells[3].get_text(' ', strip=True), 'Seeds': cells[4].get_text(), 'Peers': cells[5].get_text()})
         category = query.get('c', ['1002'])[0]
         page = int(query.get('page', ['0'])[0])
@@ -54,7 +57,7 @@ def parse(provider, html, path):
             def text(selector):
                 node = tr.select_one(selector)
                 return node.get_text('', strip=True) if node else ''
-            rows.append({'Id': match[1], 'Title': a.get_text('', strip=True), 'Size': text('a.f-dl'),
+            rows.append({'Id': match[1], 'Title': re.sub(r'\s+', ' ', a.get_text()).strip(), 'Size': text('a.f-dl'),
                          'Seeds': text('.seedmed'), 'Peers': text('.leechmed')})
         if not is_index:
             forum = query['f'][0]; start = int(query.get('start', ['0'])[0]); pages = []

@@ -55,11 +55,13 @@ def parse_detail(provider, html, url):
             src = img.get('src', '')
             if src.startswith(('http://', 'https://')) and src not in pictures:
                 pictures.append(src)
-    return {'description': description[:12000], 'director': field('Режисс[её]р')[:500],
+    director = re.split(r'\s+(?:О фильме|О сериале|Описание|В ролях|Акт[её]ры|Жанр|Страна|Год выпуска)\s*:', field('Режисс[её]р'), maxsplit=1, flags=re.I)[0]
+    return {'description': description[:12000], 'director': director[:500],
             'poster': poster, 'screenshots': [p for p in pictures if p != poster][:3], 'audio': field('Аудио')[:1500],
             'external_ids': identifiers,
             'dimensions': dimensions[0] if dimensions else '',
-            'detail_title': title.get_text('', strip=True) if title else ''}
+            'detail_series': bool(re.search(r'(?i)(?:\bS\d{1,3}E\d|\b(?:сезон|season)\s*\d|\b\d+\s*сезон|список серий)', text)),
+            'detail_title': re.sub(r'\s+', ' ', title.get_text('', strip=False)).strip() if title else ''}
 
 
 class Metadata:

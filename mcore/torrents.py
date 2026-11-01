@@ -199,7 +199,9 @@ class Torrents:
                 if size and not handle.have_piece(piece):
                     handle.set_piece_deadline(piece, 0)
                     missing += info.piece_size(piece)
-            result['ready'] = missing == 0 and size > 0 and (position == 0 or duration > 0)
+            result['ready'] = missing == 0 and size > 0 and duration > 0
+            total = sum(info.piece_size(piece) for piece in wanted)
+            result['buffer_percent'] = min(100 if duration else 99, round(100*(total-missing)/max(1,total)))
             result['buffer_eta'] = round(missing / status.download_payload_rate) if status.download_payload_rate else None
             result['file_size'] = size
             result.update(buffer_basis='average_bitrate' if duration else 'fallback', duration_ms=metadata.get('duration_ms'),

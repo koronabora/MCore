@@ -129,6 +129,8 @@ def test_buffer_requires_entire_index_window(client, monkeypatch):
     try:
         assert not manager.status('index-test')['ready']
         available.update(range(56, 64))
+        assert not manager.status('index-test')['ready']
+        manager.media_info[('index-test', 0)] = {'duration_ms': 128000}
         assert manager.status('index-test')['ready']
     finally:
         del manager.handles['index-test']
@@ -188,7 +190,8 @@ def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypat
         path = f'/v1/torrents/{key}/files/0'
         status = client.get(f'/v1/torrents/{key}', headers=auth)
         assert status.status_code == 200, status.text
-        assert status.json()['ready']
+        assert not status.json()['ready'], 'Verified bytes alone do not make random data playable'
+        assert status.json()['buffer_missing_bytes'] == 0
         assert client.get(path).status_code == 401
         head = client.head(path, headers=auth)
         assert int(head.headers['Content-Length']) == len(payload)

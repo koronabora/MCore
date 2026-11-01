@@ -6,6 +6,7 @@ import hashlib
 import time
 import re
 from pathlib import PurePath
+from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
@@ -36,7 +37,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.0', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.1', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -99,7 +100,7 @@ async def search(q: str = Query(min_length=1, max_length=150), live: bool = True
         with app.state.store.connect() as db:
             db.execute('INSERT OR REPLACE INTO queries VALUES (?,?,?)', (uid, q, time.time()))
     errors = await asyncio.gather(*(catalog.provider_search(p, q) for p in catalog.config['providers'])) if live else []
-    if live:
+    if live or len(q) >= 4:
         await catalog.enrich(catalog.movies(q))
     return {'movies': catalog.movies(q), 'unavailable_providers': [e for e in errors if e]}
 
@@ -162,11 +163,18 @@ async def poster(mid: str, uid=Depends(user)):
                 break
     if not url:
         raise HTTPException(404, 'Poster unavailable')
-    try:
-        content, media_type = await image_bytes(url)
-    except (ValueError, OSError, httpx.HTTPError):
+    urls = list(dict.fromkeys([url]+[i['poster'] for i in app.state.catalog.movie_releases(mid) if i.get('poster')]))
+    content = None
+    for candidate in urls[:3]:
+        try:
+            content, media_type = await image_bytes(candidate)
+            break
+        except (ValueError, OSError, httpx.HTTPError):
+            continue
+    if content is None:
         raise HTTPException(502, 'Poster source unavailable')
-    return Response(content, media_type=media_type)
+    director = next((item.get('director') for item in app.state.catalog.movie_releases(mid) if item.get('director')), '')
+    return Response(content, media_type=media_type, headers={'X-MCore-Director': quote(director)})
 
 
 @app.get('/v1/releases/{rid}/screenshots/{index}')
