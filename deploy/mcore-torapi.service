@@ -1,0 +1,18 @@
+[Unit]
+Description=Internal TorAPI adapter
+After=network-online.target
+
+[Service]
+User=mcore
+Group=mcore
+WorkingDirectory=/opt/mcore/torapi
+ExecStart=/usr/bin/node /opt/mcore/torapi/node_modules/torapi/main.js --port 8443
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

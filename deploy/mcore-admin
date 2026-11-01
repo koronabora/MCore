@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+cd /opt/mcore/app
+exec runuser -u mcore -- /opt/mcore/venv/bin/python -m mcore.cli "$@"

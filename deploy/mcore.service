@@ -1,0 +1,21 @@
+[Unit]
+Description=MCore private media API
+After=network-online.target mcore-torapi.service
+Wants=network-online.target
+
+[Service]
+User=mcore
+Group=mcore
+WorkingDirectory=/opt/mcore/app
+Environment=MCORE_CONFIG=/etc/mcore/config.toml
+ExecStart=/opt/mcore/venv/bin/python -m mcore
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mcore /var/cache/mcore
+
+[Install]
+WantedBy=multi-user.target
