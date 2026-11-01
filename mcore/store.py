@@ -23,6 +23,10 @@ class Store:
                 CREATE TABLE IF NOT EXISTS releases (id TEXT PRIMARY KEY, movie TEXT, data TEXT, updated REAL);
                 CREATE TABLE IF NOT EXISTS torrents (id TEXT PRIMARY KEY, magnet TEXT, added REAL, size INTEGER DEFAULT 0);
             ''')
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(history)')}
+            for name, kind in [('torrent', 'TEXT'), ('file', 'INTEGER')]:
+                if name not in columns:
+                    db.execute(f'ALTER TABLE history ADD COLUMN {name} {kind}')
         self.path.chmod(0o600)
 
     def connect(self):

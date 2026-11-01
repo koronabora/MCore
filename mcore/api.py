@@ -12,6 +12,7 @@ from .store import Store
 from .catalog import Catalog
 from .torrents import Torrents, byte_range
 from .images import image_bytes
+from .inspection import Inspection
 
 
 @asynccontextmanager
@@ -20,6 +21,7 @@ async def lifespan(app):
     app.state.store = Store(config['state_dir'])
     app.state.catalog = Catalog(app.state.store, config)
     app.state.torrents = Torrents(app.state.store, config)
+    app.state.inspection = Inspection(app.state.torrents, config['state_dir'])
     tasks = [asyncio.create_task(app.state.catalog.synchronize()), asyncio.create_task(app.state.torrents.maintain())]
     yield
     for task in tasks:
@@ -101,8 +103,9 @@ async def movie(mid: str, uid=Depends(user)):
     if result is None:
         raise HTTPException(404, 'Movie not found')
     with app.state.store.connect() as db:
-        row = db.execute('SELECT position FROM history WHERE user=? AND movie=?', (uid, mid)).fetchone()
+        row = db.execute('SELECT position,torrent,file FROM history WHERE user=? AND movie=?', (uid, mid)).fetchone()
     result['position'] = row['position'] if row else 0
+    result['resume'] = {'torrent': row['torrent'], 'file': row['file']} if row and row['torrent'] else None
     return result
 
 
@@ -133,8 +136,36 @@ async def poster(mid: str, uid=Depends(user)):
     return Response(content, media_type=media_type)
 
 
+@app.get('/v1/releases/{rid}/screenshots/{index}')
+async def screenshot(rid: str, index: int, uid=Depends(user)):
+    if not 0 <= index <= 2:
+        raise HTTPException(404, 'Screenshot not found')
+    release = app.state.catalog.release(rid)
+    if not release:
+        raise HTTPException(404, 'Release not found')
+    try:
+        sources = release.get('screenshots') or []
+        if index < len(sources):
+            content, media_type = await image_bytes(sources[index])
+        else:
+            content, media_type = await app.state.inspection.frame(release, index), 'image/jpeg'
+    except (ValueError, RuntimeError, KeyError, OSError, TimeoutError, httpx.HTTPError):
+        raise HTTPException(404, 'Screenshot not yet available')
+    return Response(content, media_type=media_type)
+
+
+@app.get('/v1/torrents/{key}/files/{index}/info')
+async def media_info(key: str, index: int, uid=Depends(user)):
+    try:
+        return await app.state.inspection.metadata(key, index)
+    except (ValueError, KeyError, OSError, TimeoutError):
+        raise HTTPException(409, 'Media metadata is not yet available')
+
+
 class Position(BaseModel):
     position: int = Field(ge=0, le=604800000)
+    torrent: str | None = Field(default=None, pattern=r'^[a-f0-9]{40,64}$')
+    file: int | None = Field(default=None, ge=0)
 
 
 @app.put('/v1/history/{mid}')
@@ -142,7 +173,10 @@ def history(mid: str, body: Position, uid=Depends(user)):
     with app.state.store.connect() as db:
         if not db.execute('SELECT 1 FROM releases WHERE movie=?', (mid,)).fetchone():
             raise HTTPException(404, 'Movie not found')
-        db.execute('INSERT OR REPLACE INTO history VALUES (?,?,?,?)', (uid, mid, body.position, time.time()))
+        db.execute('''INSERT INTO history(user,movie,position,updated,torrent,file) VALUES (?,?,?,?,?,?)
+                      ON CONFLICT(user,movie) DO UPDATE SET position=excluded.position,updated=excluded.updated,
+                      torrent=COALESCE(excluded.torrent,history.torrent),file=COALESCE(excluded.file,history.file)''',
+                   (uid, mid, body.position, time.time(), body.torrent, body.file))
     return {'ok': True}
 
 

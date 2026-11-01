@@ -51,7 +51,11 @@ def test_auth_history_isolation_and_reinstallation(client):
     release = normalize('rutor', {'Name': 'Test movie (2024) 1080p', 'Id': '123'})
     app.state.catalog.put(release)
     mid = release['movie']
+    assert client.put('/v1/history/' + mid, headers=first, json={'position': 100, 'torrent': 'a'*40, 'file': 3}).status_code == 200
     assert client.put('/v1/history/' + mid, headers=first, json={'position': 12345}).status_code == 200
+    with app.state.store.connect() as db:
+        row = db.execute('SELECT torrent,file FROM history WHERE movie=?', (mid,)).fetchone()
+        assert row['torrent'] == 'a'*40 and row['file'] == 3
     assert client.get('/v1/home', headers=other).json()['history'] == []
     response = client.post('/v1/pair', json={'token': app.state.store.invite('first')})
     restored = {'Authorization': 'Bearer ' + response.json()['key']}
@@ -81,6 +85,7 @@ def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypat
         return {'magnet': lt.make_magnet_uri(info)}
     monkeypatch.setattr(app.state.catalog, 'detail', detail)
     try:
+        app.state.torrents.config['cache_bytes'] = 1048576
         response = client.post('/v1/torrents', headers=auth, json={'release': 'local:1'})
         assert response.status_code == 200, response.text
         key = response.json()['id']
@@ -89,6 +94,11 @@ def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypat
         while not seed.is_listening() and time.monotonic()<deadline:
             time.sleep(.05)
         download.connect_peer(('127.0.0.1', seed.listen_port()))
+        while key not in app.state.torrents.errors and time.monotonic()<deadline:
+            time.sleep(.1)
+        assert 'Cache capacity' in app.state.torrents.errors.get(key, '')
+        assert download.status().total_done == 0, 'Payload must wait for cache admission'
+        app.state.torrents.config['cache_bytes'] = 104857600
         while not download.status().is_seeding and time.monotonic()<deadline:
             time.sleep(.1)
         assert download.status().is_seeding, str(download.status().errc)
