@@ -62,6 +62,8 @@ class Catalog:
                        (item['id'], item['movie'], json.dumps(item, ensure_ascii=False), time.time()))
 
     async def provider_search(self, provider, query):
+        if provider not in self.config['providers']:
+            return None
         try:
             async with self.limit:
                 response = await self.client.get('/api/search/title/' + provider, params={'query': query})
@@ -86,6 +88,8 @@ class Catalog:
         grouped = {}
         for row in rows:
             item = json.loads(row['data'])
+            if not self.enabled(item):
+                continue
             score = WRatio(query.casefold(), item['title'].casefold()) if query else 100
             if query and score < 65:
                 continue
@@ -103,12 +107,23 @@ class Catalog:
     def release(self, rid):
         with self.store.connect() as db:
             row = db.execute('SELECT data FROM releases WHERE id=?', (rid,)).fetchone()
-        return json.loads(row['data']) if row else None
+        item = json.loads(row['data']) if row else None
+        return item if item and self.enabled(item) else None
+
+    def enabled(self, item):
+        return item['provider'] == 'local' or item['provider'] in self.config['providers']
+
+    def movie_releases(self, mid):
+        with self.store.connect() as db:
+            rows = db.execute('SELECT data FROM releases WHERE movie=?', (mid,)).fetchall()
+        return [item for row in rows if self.enabled(item := json.loads(row['data']))]
 
     async def detail(self, rid):
         item = self.release(rid)
         if item is None:
             return None
+        if item['provider'] == 'local':
+            return item
         try:
             async with self.limit:
                 response = await self.client.get('/api/search/id/' + item['provider'], params={'query': item['source_id']})
@@ -134,15 +149,13 @@ class Catalog:
         return item
 
     async def movie(self, mid):
-        with self.store.connect() as db:
-            rows = db.execute('SELECT id FROM releases WHERE movie=?', (mid,)).fetchall()
-        if not rows:
+        items = self.movie_releases(mid)
+        if not items:
             return None
-        items = [self.release(row['id']) for row in rows]
         # Search refresh updates seed/peer counts which many detail endpoints omit.
         await asyncio.gather(*(self.provider_search(p, items[0]['title']) for p in {i['provider'] for i in items}))
-        await asyncio.gather(*(self.detail(row['id']) for row in rows[:12]))
-        items = [self.release(row['id']) for row in rows]
+        await asyncio.gather(*(self.detail(item['id']) for item in items[:12]))
+        items = self.movie_releases(mid)
         best = max(items, key=lambda i: len(i.get('description', '')))
         return {'id': mid, **{k: best[k] for k in ('title', 'year', 'director', 'description')},
                 'releases': [self.public(i) for i in items]}
@@ -153,7 +166,8 @@ class Catalog:
             try:
                 with self.store.connect() as db:
                     queries = [r['query'] for r in db.execute('SELECT DISTINCT query FROM queries')]
-                    releases = [r['id'] for r in db.execute('SELECT id FROM releases ORDER BY updated')]
+                    releases = [item['id'] for r in db.execute('SELECT data FROM releases ORDER BY updated')
+                                if (item := json.loads(r['data']))['provider'] in self.config['providers']]
                     known = {(item['provider'], item['title']) for item in
                              (json.loads(r['data']) for r in db.execute('SELECT data FROM releases'))
                              if item['provider'] in self.config['providers']}

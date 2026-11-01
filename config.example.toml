@@ -9,7 +9,7 @@ sync_seconds = 21600
 torapi_url = "http://127.0.0.1:8443"
 tls_cert = "/etc/mcore/tls.crt"
 tls_key = "/etc/mcore/tls.key"
-providers = ["rutracker", "kinozal", "rutor", "nonameclub"]
+providers = ["rutracker", "kinozal"]
 
 [torrent]
 # Forward this port to the server for BOTH TCP and UDP (uTP and DHT).

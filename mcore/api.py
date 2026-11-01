@@ -115,18 +115,17 @@ def home(uid=Depends(user)):
         queries = [r['query'] for r in db.execute('SELECT query FROM queries WHERE user=? ORDER BY updated DESC LIMIT 8', (uid,))]
         history = []
         for row in db.execute('SELECT * FROM history WHERE user=? ORDER BY updated DESC LIMIT 30', (uid,)):
-            release = db.execute('SELECT data FROM releases WHERE movie=? LIMIT 1', (row['movie'],)).fetchone()
-            if release:
-                item = json.loads(release['data'])
+            releases = app.state.catalog.movie_releases(row['movie'])
+            if releases:
+                item = releases[0]
                 history.append({'id': row['movie'], 'title': item['title'], 'year': item['year'], 'position': row['position']})
     return {'queries': queries, 'history': history}
 
 
 @app.get('/v1/movies/{mid}/poster')
 async def poster(mid: str, uid=Depends(user)):
-    with app.state.store.connect() as db:
-        rows = db.execute('SELECT data FROM releases WHERE movie=?', (mid,)).fetchall()
-    url = next((json.loads(r['data']).get('poster') for r in rows if json.loads(r['data']).get('poster')), None)
+    items = app.state.catalog.movie_releases(mid)
+    url = next((item['poster'] for item in items if item.get('poster')), None)
     if not url:
         raise HTTPException(404, 'Poster unavailable')
     try:

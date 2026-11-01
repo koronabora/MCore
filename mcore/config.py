@@ -15,5 +15,9 @@ def load():
     if not config['public_url'].startswith('https://'):
         raise ValueError('HTTPS required')
     config['torrent'] = validate_torrent(config.get('torrent', {}), config['port'])
+    providers = config.get('providers', ['rutracker', 'kinozal'])
+    if not isinstance(providers, list) or any(p not in ('rutracker', 'kinozal') for p in providers):
+        raise ValueError('Supported providers: rutracker, kinozal')
+    config['providers'] = list(dict.fromkeys(providers))
     Path(config['state_dir']).mkdir(parents=True, exist_ok=True, mode=0o700)
     return config
