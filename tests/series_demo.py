@@ -34,6 +34,7 @@ for video in root.glob('MCore.Series.*'):
     shutil.copy2(video, destination/video.name)
 resume = Path(config['state_dir'])/'resume'; resume.mkdir(exist_ok=True)
 (resume/(key+'.torrent')).write_bytes(metadata)
+(resume/(key+'.resume')).unlink(missing_ok=True)  # Recheck freshly restored fixture bytes.
 with store.connect() as db:
     db.execute('INSERT OR IGNORE INTO torrents VALUES (?,?,?,?)', (key, magnet, time.time(), info.total_size()))
 catalog = Catalog(store, config)
