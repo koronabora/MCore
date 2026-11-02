@@ -162,6 +162,27 @@ def activity(database):
         db.close()
 
 
+def torrent_activity(path, pid, now):
+    result = dict(available=False, stale=True, updated=0, rows=[], message='')
+    try:
+        with path.open('r', encoding='utf-8') as file:
+            value = json.loads(file.read(8*1024*1024))
+        if value.get('schema') != 1 or not isinstance(value.get('torrents'), list):
+            raise ValueError('Неподдерживаемый формат статистики')
+        updated = float(value['updated'])
+        rows = value['torrents']
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError('Некорректный список раздач')
+        stale = not pid or value['pid'] != pid or not -5 <= now-updated <= 15
+        result.update(available=True, stale=stale, updated=updated, rows=rows,
+                      message='Снимок устарел или принадлежит прежнему процессу; скорости скрыты' if stale else '')
+    except FileNotFoundError:
+        result['message'] = 'Статистика ещё не опубликована MCore. Нужен запуск версии с экспортом статистики.'
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        result['message'] = 'Статистика недоступна: '+clean(error)
+    return result
+
+
 class DiskScan:
     """Slow disk walks run off-screen, at most once per minute, at low priority."""
     def __init__(self, paths, interval):
@@ -258,6 +279,7 @@ class Monitor:
         self.disk.refresh()
         result['disk'] = self.disk.snapshot()
         result['cache_limit'] = self.config['cache_bytes']
+        result['torrents'] = torrent_activity(Path(self.config['state_dir'])/'torrent-stats.json', current['pid'], result['time'])
         return result
 
 
@@ -265,7 +287,7 @@ def percent(value):
     return '—' if value is None else f'{value:.1f}%'
 
 
-def lines(snapshot, offset=0):
+def lines(snapshot, offset=0, include_torrents=True):
     s, r, svc = snapshot['system'], snapshot['rates'], snapshot['service']
     now = snapshot['time']
     yield 'MCORE TOP   '+datetime.datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')
@@ -300,15 +322,47 @@ def lines(snapshot, offset=0):
         yield 'Диск: '+disk['error']
     for error in snapshot['errors']:
         yield 'Ошибка: '+error
+    if include_torrents:
+        yield ''
+        yield from torrent_lines(snapshot)
 
 
-def interactive(screen, monitor, interval):
+def torrent_lines(snapshot, offset=0, include_metadata=False):
+    data = snapshot['torrents']
+    all_rows = data['rows']
+    rows = [row for row in all_rows if include_metadata or not row.get('metadata_only')]
+    rows.sort(key=lambda row: (-(row.get('download_rate') or 0)-(row.get('upload_rate') or 0), str(row.get('name', ''))))
+    yield 'MCORE TOP — РАЗДАЧИ'
+    yield f"Показано {len(rows)} / {len(all_rows)}; только индекс: {sum(bool(r.get('metadata_only')) for r in all_rows)}; m — показать/скрыть индекс"
+    yield 'Отдано и скорости ↑ — торрент-пирам, не HTTP-трафик просмотра. GB = 1 000 000 000 байт.'
+    yield f"Снимок: {age(data['updated'], snapshot['time'])}; процент — от всей раздачи, не только выбранного файла."
+    if data['message']:
+        yield data['message']
+    if not data['available']:
+        return
+    if not data['stale']:
+        yield f"Всего: ↓ {size(sum(r.get('download_rate') or 0 for r in all_rows))}/с  ↑ {size(sum(r.get('upload_rate') or 0 for r in all_rows))}/с"
+    yield ''
+    yield f"{'Скачано':>8} {'Отдано GB':>10} {'↓ /с':>14} {'↑ /с':>14}  {'Статус':<25}  Название"
+    for row in rows[offset:]:
+        uploaded = '—' if row.get('uploaded') is None else f"{row['uploaded']/1_000_000_000:.3f}"
+        down = None if data['stale'] else row.get('download_rate')
+        up = None if data['stale'] else row.get('upload_rate')
+        name = clean(row.get('name', row.get('id', '?')))
+        error = clean(row.get('error', ''))
+        yield f"{percent(row.get('percent')):>8} {uploaded:>10} {size(down):>14} {size(up):>14}  {clean(row.get('state', '?')):<25}  {name}"+(' | '+error if error else '')
+    if not rows:
+        yield 'Раздач с видеоданными пока нет.' if not include_metadata else 'Раздач пока нет.'
+
+
+def interactive(screen, monitor, interval, view='server'):
     try:
         curses.curs_set(0)
     except curses.error:
         pass
     screen.timeout(200)
     offset, paused, due, snapshot = 0, False, 0, None
+    include_metadata = False
     while True:
         if not paused and time.monotonic() >= due:
             snapshot = monitor.sample()
@@ -316,13 +370,13 @@ def interactive(screen, monitor, interval):
         if snapshot:
             screen.erase()
             height, width = screen.getmaxyx()
-            content = list(lines(snapshot, offset))
+            content = list(torrent_lines(snapshot, offset, include_metadata) if view == 'torrents' else lines(snapshot, offset, include_torrents=False))
             for row, text in enumerate(content[:max(0, height-1)]):
                 try:
                     screen.addnstr(row, 0, clean(text), max(0, width-1), curses.A_BOLD if row == 0 else 0)
                 except curses.error:
                     pass
-            footer = ('ПАУЗА  ' if paused else '')+'q: выход  пробел: пауза  r: обновить  ↑/↓: пользователи'
+            footer = ('ПАУЗА  ' if paused else '')+'1: сервер  2: раздачи  q: выход  пробел: пауза  r: обновить  ↑/↓: строки  m: индекс'
             try:
                 screen.addnstr(height-1, 0, footer, max(0, width-1), curses.A_REVERSE)
             except curses.error:
@@ -333,10 +387,16 @@ def interactive(screen, monitor, interval):
             return
         if key == ord(' '):
             paused = not paused
+        elif key in (ord('1'), ord('2'), 9):
+            view = ('torrents' if view == 'server' else 'server') if key == 9 else ('server' if key == ord('1') else 'torrents')
+            offset = 0
+        elif key in (ord('m'), ord('M')):
+            include_metadata, offset = not include_metadata, 0
         elif key in (ord('r'), ord('R')):
             paused, due = False, 0
         elif key == curses.KEY_DOWN and snapshot:
-            offset = min(max(0, len(snapshot['users'])-1), offset+1)
+            count = len([r for r in snapshot['torrents']['rows'] if include_metadata or not r.get('metadata_only')]) if view == 'torrents' else len(snapshot['users'])
+            offset = min(max(0, count-1), offset+1)
         elif key == curses.KEY_UP:
             offset = max(0, offset-1)
 
@@ -347,6 +407,7 @@ def main():
     parser.add_argument('--interval', type=float, default=2, help='обновление экрана, секунды (минимум 1)')
     parser.add_argument('--disk-interval', type=float, default=60, help='подсчёт каталогов, секунды (минимум 60)')
     parser.add_argument('--interface', help='сетевой интерфейс; по умолчанию основной маршрут')
+    parser.add_argument('--view', choices=('server', 'torrents'), default='server', help='начальная панель')
     parser.add_argument('--once', action='store_true', help='один текстовый снимок')
     parser.add_argument('--json', action='store_true', help='один снимок JSON')
     args = parser.parse_args()
@@ -364,9 +425,9 @@ def main():
                 if monitor.disk.thread:
                     monitor.disk.thread.join(timeout=21)
                 snapshot['disk'] = monitor.disk.snapshot()
-                print(json.dumps(snapshot, ensure_ascii=False, indent=2) if args.json else '\n'.join(lines(snapshot)))
+                print(json.dumps(snapshot, ensure_ascii=False, indent=2) if args.json else '\n'.join(torrent_lines(snapshot) if args.view == 'torrents' else lines(snapshot)))
             else:
-                curses.wrapper(interactive, monitor, args.interval)
+                curses.wrapper(interactive, monitor, args.interval, args.view)
         finally:
             monitor.disk.close()
     except KeyboardInterrupt:

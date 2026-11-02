@@ -74,3 +74,28 @@ def test_terminal_control_characters_are_not_rendered():
     assert '\x1b' not in monitor.clean('name\x1b[2J\nnext')
     assert '\n' not in monitor.clean('name\nnext')
     assert monitor.clean('Тестировщик') == 'Тестировщик'
+
+
+def test_torrent_panel_hides_stale_rates_and_distinguishes_gb(tmp_path):
+    path = tmp_path/'torrent-stats.json'
+    row = dict(name='Video', state='Скачивание', percent=25, uploaded=12_500_000_000,
+               download_rate=1024, upload_rate=2048, metadata_only=False)
+    path.write_text(json.dumps(dict(schema=1, pid=42, updated=100, torrents=[row])))
+    current = monitor.torrent_activity(path, 42, 105)
+    assert current['available'] and not current['stale']
+    panel = '\n'.join(monitor.torrent_lines(dict(time=105, torrents=current)))
+    assert '25.0%' in panel and '12.500' in panel and '2.0 KiB' in panel
+    for pid, now in ((43, 105), (42, 116)):
+        stale = monitor.torrent_activity(path, pid, now)
+        assert stale['stale']
+        panel = '\n'.join(monitor.torrent_lines(dict(time=now, torrents=stale)))
+        assert '2.0 KiB' not in panel and '1.0 KiB' not in panel
+        assert 'устарел' in panel
+
+
+def test_missing_telemetry_does_not_break_monitor(tmp_path):
+    path = tmp_path/'missing.json'
+    data = monitor.torrent_activity(path, 42, time.time())
+    assert not data['available'] and data['message']
+    path.write_text('{incomplete')
+    assert not monitor.torrent_activity(path, 42, time.time())['available']
