@@ -101,7 +101,7 @@ class Metadata:
         self.url = config.get('flaresolverr_url', 'http://127.0.0.1:8191/v1')
         self.sites = config.get('detail_sites', {'kinozal': 'https://kinozal.me', 'rutracker': 'https://rutracker.org'})
         self.client = httpx.AsyncClient(timeout=75, trust_env=False)
-        self.limit = asyncio.Semaphore(2)
+        self.limit = asyncio.Semaphore(4)
 
     async def detail(self, provider, rid):
         if provider not in self.sites or not str(rid).isdigit():

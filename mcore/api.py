@@ -42,7 +42,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.7', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.9', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -120,6 +120,8 @@ async def search(q: str = Query(min_length=1, max_length=150), live: bool = True
 
 @app.get('/v1/movies/{mid}')
 async def movie(mid: str, uid=Depends(user)):
+    # Index known sources while refreshing counters and the card's description.
+    app.state.source_index.schedule(app.state.catalog.movie_releases(mid))
     result = await app.state.catalog.movie(mid)
     if result is None:
         raise HTTPException(404, 'Movie not found')
@@ -294,7 +296,13 @@ async def start(body: Start, uid=Depends(user)):
 
 
 async def start_release(body, metadata_only=False):
-    release = await app.state.catalog.detail(body.release)
+    release = app.state.catalog.release(body.release) if metadata_only else None
+    # An existing torrent/link is sufficient for a file list; fetching the full
+    # description first used to serialize indexing behind unrelated HTML requests.
+    if metadata_only and release and release.get('torrent_id') in app.state.torrents.handles:
+        return {'id': release['torrent_id']}
+    if not release or not (release.get('download') or release.get('magnet')):
+        release = await app.state.catalog.detail(body.release)
     if not release:
         raise HTTPException(404, 'Release not found')
     try:

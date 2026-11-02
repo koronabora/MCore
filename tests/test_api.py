@@ -16,6 +16,25 @@ def free_port():
         return s.getsockname()[1]
 
 
+def test_metadata_index_uses_download_without_waiting_for_description(monkeypatch):
+    from types import SimpleNamespace
+    from mcore.api import Start, start_release
+    release = dict(id='local:ready', download='test-link')
+    async def forbidden(*args):
+        raise AssertionError('Description fetch must not delay available torrent metadata')
+    async def download(url):
+        assert url == 'test-link'
+        return b'torrent'
+    async def add(source, metadata_only=False):
+        assert source == b'torrent' and metadata_only
+        return 'hash'
+    catalog = SimpleNamespace(release=lambda rid: release, detail=forbidden,
+                              jackett=SimpleNamespace(download=download), put=lambda r: None)
+    monkeypatch.setattr(app.state, 'catalog', catalog, raising=False)
+    monkeypatch.setattr(app.state, 'torrents', SimpleNamespace(handles={}, add=add), raising=False)
+    assert asyncio.run(start_release(Start(release='local:ready'), metadata_only=True)) == {'id': 'hash'}
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     config = tmp_path / 'config.toml'

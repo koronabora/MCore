@@ -12,6 +12,14 @@ def identify(name, release):
         return f'film{int(film[1]):03}part{number:03}', int(film[1]), number
     if re.search(r'(?i)S\d+[ ._-]*E\d+(?:[ ._-]+E?\d+|E\d+)', normalized):
         return '', None, None
+    # Some releases use ep.-06x13 for episode 6 of 13, not season 6/episode 13.
+    numbered = re.search(r'(?i)\bep[._ -]+(\d{1,4})x(\d{1,4})(?!\d)', normalized.rsplit('/', 1)[-1])
+    if numbered:
+        ordinal = re.search(r'(?i)\b(\d{1,3})(?:st|nd|rd|th)[ ._-]+season\b', normalized)
+        season_value = ordinal[1] if ordinal else release.get('season', '')
+        if str(season_value).isdigit() and 0 < int(numbered[1]) <= int(numbered[2]):
+            season, number = int(season_value), int(numbered[1])
+            return f's{season:03}e{number:04}', season, number
     match = re.search(r'(?i)\bS(\d{1,3})[ ._-]*E(\d{1,4})(?!\d|[ ._-]*E\d)', normalized)
     if not match:
         match = re.search(r'(?i)\b(\d{1,3})x(\d{1,4})(?!\d)', normalized)
