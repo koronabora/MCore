@@ -41,7 +41,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.5', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.7', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -139,6 +139,7 @@ async def movie(mid: str, uid=Depends(user)):
             if files:
                 episodes.register(app.state.store, release, key, files)
     result.update(episodes.catalog(app.state.store, releases, aliases, uid))
+    result['releases'] = [app.state.catalog.public(r) for r in releases]
     return result
 
 

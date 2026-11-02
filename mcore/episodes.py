@@ -26,6 +26,12 @@ def identify(name, release):
     if str(value).isdigit() and episode:
         number = int(next(x for x in episode.groups() if x))
         return f's{int(value):03}e{number:04}', int(value), number
+    # Explicit episode labels identify a series even when the tracker omitted its season.
+    # Plain numeric filenames alone are not evidence of episodes.
+    explicit = re.search(r'(?i)(?:серия|эпизод|episode)[ ._-]*(\d{1,4})(?!\d)', normalized.rsplit('/', 1)[-1])
+    if explicit and not value:
+        number = int(explicit[1])
+        return f's000e{number:04}', 0, number
     return '', None, None
 
 
@@ -34,7 +40,7 @@ def register(store, release, torrent, files):
         db.execute('DELETE FROM source_files WHERE release=?', (release['id'],))
         for file in files:
             episode, season, number = identify(file['name'], release)
-            if not release.get('series'):
+            if not release.get('series') and not episode:
                 episode = 'movie' if len(files) == 1 else ''
             episode = episode or f"file:{torrent}:{file['index']}"
             data = dict(file, episode=episode, season=season, number=number, torrent=torrent, release=release['id'])
@@ -81,6 +87,11 @@ def catalog(store, releases, aliases, uid):
         if row['release'] not in by_release:
             continue
         file = json.loads(row['data'])
+        # Reinterpret cached manifests as well as newly indexed torrents.
+        identity, season, number = identify(file['name'], by_release[row['release']])
+        if identity:
+            file.update(episode=identity, season=season, number=number)
+            by_release[row['release']]['series'] = True
         manifests.setdefault(row['release'], []).append(file)
         key = file['episode']
         item = groups.setdefault(key, dict(id=key, season=file['season'], number=file['number'], name=file['name'], sources=[], position=0, completed=False, last_watched=key == latest))
@@ -93,6 +104,23 @@ def catalog(store, releases, aliases, uid):
         match = re.search(r'(?i)(?:сери[ияй]|episodes?)\s*[: ]*1\s*[-–]\s*(\d+)\s*(?:из|of)\s*(\d+)', release.get('release_title', ''))
         if season.isdigit() and match and match[1] == match[2] and int(match[2]) <= 1000:
             totals[int(season)] = max(totals.get(int(season), 0), int(match[2]))
+        # A complete multi-season pack must prove both its declared total and
+        # contiguous episode numbering in every declared season. Duplicate cuts
+        # of one episode do not count as additional episodes.
+        span = re.fullmatch(r'(\d+)\s*[-–]\s*(\d+)', season)
+        if span and match and match[1] == match[2] and 0 < int(match[2]) <= 1000:
+            first, last = map(int, span.groups())
+            files = manifests.get(release['id'], [])
+            numbers = {}
+            for f in files:
+                if f['season'] is not None and f['number'] is not None:
+                    numbers.setdefault(f['season'], set()).add(f['number'])
+            if (0 < first <= last <= 1000 and set(numbers) == set(range(first, last+1))
+                    and sum(map(len, numbers.values())) == int(match[2])
+                    and all(ns == set(range(1, len(ns)+1)) for ns in numbers.values())
+                    and all(f['season'] is not None and f['number'] is not None for f in files)):
+                for n, ns in numbers.items():
+                    totals.setdefault(n, len(ns))
     complete = {}
     for rid, files in manifests.items():
         complete[rid] = [season for season, count in totals.items() if count > 0 and
