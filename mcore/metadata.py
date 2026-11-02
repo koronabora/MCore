@@ -1,9 +1,39 @@
 """Public tracker detail metadata, fetched only on MCore through FlareSolverr."""
 import asyncio
 import re
+from html import unescape
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 import httpx
+
+
+def clean_description(value):
+    """Normalize tracker HTML, including escaped markup; discard indexer uploader blurbs."""
+    value = str(value or '')
+    for _ in range(3):
+        decoded = unescape(value)
+        if decoded == value:
+            break
+        value = decoded
+    soup = BeautifulSoup(value, 'html.parser')
+    for tag in soup.select('script,style'):
+        tag.decompose()
+    for tag in soup.select('br,hr'):
+        tag.replace_with('\n')
+    for tag in soup.select('p,div,li'):
+        tag.append('\n')
+    text = soup.get_text('', strip=False)
+    if re.search(r'(?i)\buploader\s*:', text):
+        synopsis = re.search(r'(?is)(?:Описание|О фильме|О сериале|Сюжет)\s*:\s*(.+)', text)
+        if not synopsis:
+            return ''
+        text = synopsis[1]
+        text = re.split(r'(?i)\buploader\s*:', text)[0]
+    return re.sub(r'\n\s*\n+', '\n\n', re.sub(r'[^\S\n]+', ' ', text)).strip()[:12000]
+
+
+def usable_image_url(url):
+    return not re.search(r'(?i)captcha|/smiles/|/buttons/|rating\.|\.gif(?:\?|$)', url)
 
 
 def parse_detail(provider, html, url):
@@ -34,7 +64,7 @@ def parse_detail(provider, html, url):
     pictures = []
     for img in root.select('img.postImg, img.postImgAligned'):
         src = img.get('src') or img.get('data-src', '')
-        if src and not any(x in src for x in ('/buttons/', 'rating.', '.gif', '/smiles/')):
+        if src and usable_image_url(src):
             pictures.append(urljoin(url, src))
     if not poster and pictures:
         poster = pictures[0]
@@ -57,7 +87,7 @@ def parse_detail(provider, html, url):
                 pictures.append(src)
     director = re.split(r'\s+(?:О фильме|О сериале|Описание|В ролях|Акт[её]ры|Жанр|Страна|Год выпуска)\s*:', field('Режисс[её]р'), maxsplit=1, flags=re.I)[0]
     magnet = next((a['href'] for a in soup.select('a[href^="magnet:?"]') if re.search(r'xt=urn:btih:(?:[a-fA-F0-9]{40}|[A-Z2-7]{32})(?:&|$)', a['href'])), '')
-    return {'description': description[:12000], 'director': director[:500],
+    return {'description': clean_description(description), 'director': director[:500],
             'magnet': magnet,
             'poster': poster, 'screenshots': [p for p in pictures if p != poster][:3], 'audio': field('Аудио')[:1500],
             'external_ids': identifiers,
@@ -99,6 +129,6 @@ class Metadata:
             parent = img.find_parent('a')
             full = parent.get('href', '') if parent else ''
             src = full if re.search(r'(?i)\.(?:jpg|jpeg|png|webp)(?:\?|$)', full) else img['src']
-            if src.startswith(('http://', 'https://', '//')):
+            if src.startswith(('http://', 'https://', '//')) and usable_image_url(src):
                 pictures.append(urljoin(self.sites[provider], src))
         return list(dict.fromkeys(pictures))[:3]

@@ -9,7 +9,7 @@ import unicodedata
 import httpx
 from rapidfuzz.fuzz import WRatio
 from .jackett import Jackett
-from .metadata import Metadata
+from .metadata import Metadata, clean_description
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +100,11 @@ class Catalog:
             existing = [json.loads(row['data']) for row in db.execute('SELECT data FROM releases')]
             # Reindex as one transaction; thousands of individual fsyncs delay API startup.
             for old in existing:
+                description = clean_description(old.get('description', ''))
+                if description != old.get('description', ''):
+                    old['description'] = description
+                    old['metadata_at'] = 0
+                    db.execute('UPDATE releases SET data=? WHERE id=?', (json.dumps(old,ensure_ascii=False),old['id']))
                 director = re.split(r'\s+(?:О фильме|О сериале|Описание|В ролях|Акт[её]ры|Жанр|Страна|Год выпуска)\s*:', old.get('director',''), maxsplit=1, flags=re.I)[0]
                 if director != old.get('director',''):
                     old['director'] = director
@@ -184,6 +189,7 @@ class Catalog:
                 item['movie'] = hashlib.sha256((kind+':'+sorted(strong)[0]).encode()).hexdigest()[:24]
             if before != item['movie']:
                 item['movie_aliases'] = list(dict.fromkeys(item.get('movie_aliases', [])+[before]))
+            item['description'] = clean_description(item.get('description', ''))
             db.execute('INSERT OR REPLACE INTO releases VALUES (?,?,?,?)',
                        (item['id'], item['movie'], json.dumps(item, ensure_ascii=False), time.time()))
             for alias in aliases:

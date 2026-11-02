@@ -41,7 +41,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.4', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.5', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -229,7 +229,7 @@ async def screenshot(rid: str, index: int, uid=Depends(user)):
                     app.state.catalog.put(release)
                 sources = release.get('screenshots') or []
         if index < len(sources):
-            content, media_type = await image_bytes(sources[index])
+            content, media_type = await image_bytes(sources[index], screenshot=True)
         else:
             content, media_type = await app.state.inspection.frame(release, index), 'image/jpeg'
     except (ValueError, RuntimeError, KeyError, OSError, TimeoutError, httpx.HTTPError):

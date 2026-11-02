@@ -7,7 +7,10 @@ from io import BytesIO
 from PIL import Image
 
 
-async def image_bytes(url, poster=False):
+async def image_bytes(url, poster=False, screenshot=False):
+    from .metadata import usable_image_url
+    if not usable_image_url(url):
+        raise ValueError('Not a media image')
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
         for _ in range(4):
             parsed = httpx.URL(url)
@@ -36,6 +39,8 @@ async def image_bytes(url, poster=False):
                 data = b''.join(chunks)
                 if poster:
                     validate_poster(data)
+                if screenshot:
+                    validate_screenshot(data)
                 return data, media
     raise ValueError('Too many image redirects')
 
@@ -49,3 +54,14 @@ def validate_poster(data):
             image.verify()
     except (OSError, Image.DecompressionBombError) as error:
         raise ValueError('Invalid poster') from error
+
+
+def validate_screenshot(data):
+    try:
+        with Image.open(BytesIO(data)) as image:
+            width, height = image.size
+            if width < 320 or height < 180 or not 1 <= width/height <= 2.5 or width*height > 25000000:
+                raise ValueError('Not a usable video screenshot')
+            image.verify()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ValueError('Invalid screenshot') from error
