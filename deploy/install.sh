@@ -31,6 +31,9 @@ python3 "$ROOT/deploy/patch_torapi.py" node_modules/torapi/main.js
 node --check node_modules/torapi/main.js
 install -m 0644 "$ROOT/deploy/mcore.service" "$ROOT/deploy/mcore-torapi.service" /etc/systemd/system/
 install -m 0755 "$ROOT/deploy/mcore-admin" /usr/local/sbin/mcore-admin
+install -d -m 0755 /opt/mcore/tools
+install -m 0644 "$ROOT/deploy/mcore-top.py" /opt/mcore/tools/mcore-top.py
+install -m 0755 "$ROOT/deploy/mcore-top" /usr/local/sbin/mcore-top
 systemctl daemon-reload
 systemctl enable mcore.service mcore-torapi.service
 systemctl restart mcore-torapi.service mcore.service
