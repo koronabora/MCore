@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -74,11 +75,15 @@ class Torrents:
         self.session = lt.session(settings)
         self._check_listener()
         self.handles = {}
+        with store.connect() as db:
+            self.metadata_only = {r['torrent'] for r in db.execute('SELECT torrent FROM metadata_only_torrents')}
         self.active = {}
         self.errors = {}
         self.media_info = {}
         self.last_used = {}
         self.lock = asyncio.Lock()
+        self.piece_reads = {}
+        self.piece_waiters = {}
         with store.connect() as db:
             rows = db.execute('SELECT * FROM torrents').fetchall()
         for row in rows:
@@ -87,6 +92,8 @@ class Torrents:
                 metadata = self.resume / (row['id'] + '.torrent')
                 if path.exists():
                     params = lt.read_resume_data(path.read_bytes())
+                    if params.ti is None and metadata.exists():
+                        params.ti = lt.torrent_info(metadata.read_bytes())
                 elif metadata.exists():
                     params = lt.add_torrent_params()
                     params.ti = lt.torrent_info(metadata.read_bytes())
@@ -96,6 +103,7 @@ class Torrents:
                 params.flags |= lt.torrent_flags.upload_mode
                 self._apply_peer_settings(params)
                 self.handles[row['id']] = self.session.add_torrent(params)
+                self.last_used[row['id']] = time.monotonic()
             except Exception:
                 log.exception('Could not restore torrent %s', row['id'])
 
@@ -117,7 +125,7 @@ class Torrents:
         else:
             params.flags |= lt.torrent_flags.disable_pex
 
-    async def add(self, magnet):
+    async def add(self, magnet, metadata_only=False):
         metadata = magnet if isinstance(magnet, bytes) else None
         if metadata is not None:
             params = lt.add_torrent_params()
@@ -129,6 +137,9 @@ class Torrents:
                 raise ValueError('Source has no magnet link')
             params = lt.parse_magnet_uri(magnet)
             key = str(params.info_hashes.get_best())
+            cached_metadata = self.resume / (key+'.torrent')
+            if cached_metadata.exists():
+                params.ti = lt.torrent_info(cached_metadata.read_bytes())
         self._apply_peer_settings(params)
         async with self.lock:
             if key not in self.handles:
@@ -145,7 +156,18 @@ class Torrents:
                 self.last_used[key] = time.monotonic()
                 with self.store.connect() as db:
                     db.execute('INSERT OR IGNORE INTO torrents(id,magnet,added) VALUES (?,?,?)', (key, magnet, time.time()))
+                    if metadata_only:
+                        db.execute('INSERT OR IGNORE INTO metadata_only_torrents VALUES (?)', (key,))
+                        self.metadata_only.add(key)
+            if not metadata_only:
+                self.activate(key)
             return key
+
+    def activate(self, key):
+        if key in self.metadata_only:
+            self.metadata_only.remove(key)
+            with self.store.connect() as db:
+                db.execute('DELETE FROM metadata_only_torrents WHERE torrent=?', (key,))
 
     def files(self, key):
         handle = self.handles[key]
@@ -214,6 +236,7 @@ class Torrents:
         self.last_used[key] = time.monotonic()
         try:
             cursor = start
+            cached_piece, cached_bytes = -1, b''
             while cursor <= end:
                 piece = (offset+cursor) // info.piece_length()
                 length = min(end-cursor+1, info.piece_length() - (offset+cursor) % info.piece_length(), 256*1024)
@@ -227,17 +250,75 @@ class Torrents:
                     if time.monotonic() > deadline:
                         raise TimeoutError('Torrent piece unavailable')
                     await asyncio.sleep(.15)
-                def read():
-                    with path.open('rb') as f:
-                        f.seek(cursor)
-                        return f.read(length)
-                chunk = await asyncio.to_thread(read)
+                if cached_piece != piece:
+                    cached_bytes = await self.verified_piece(key, piece)
+                    cached_piece = piece
+                within = (offset+cursor) % info.piece_length()
+                chunk = cached_bytes[within:within+length]
                 if len(chunk) != length:
                     raise IOError('Short torrent file read')
                 cursor += len(chunk)
                 yield chunk
         finally:
             self.active[key] -= 1
+
+    async def verified_piece(self, key, piece):
+        """Read through libtorrent's disk layer, never an unflushed sparse file."""
+        identity = (key, piece)
+        future = self.piece_reads.get(identity)
+        if future is None:
+            future = asyncio.get_running_loop().create_future()
+            self.piece_reads[identity] = future
+            try:
+                self.handles[key].read_piece(piece)
+            except Exception:
+                self.piece_reads.pop(identity, None)
+                future.cancel()
+                raise
+        self.piece_waiters[identity] = self.piece_waiters.get(identity, 0)+1
+        try:
+            data = await asyncio.wait_for(asyncio.shield(future), 90)
+            info = self.handles[key].torrent_file()
+            if len(data) != info.piece_size(piece):
+                raise IOError('Short torrent piece read')
+            if info.info_hashes().has_v1() and hashlib.sha1(data).digest() != bytes(info.hash_for_piece(piece)):
+                self.handles[key].force_recheck()
+                raise IOError('Torrent piece checksum mismatch; recheck scheduled')
+            return data
+        finally:
+            self.piece_waiters[identity] -= 1
+            if not self.piece_waiters[identity]:
+                self.piece_waiters.pop(identity, None)
+            if identity not in self.piece_waiters and self.piece_reads.get(identity) is future:
+                self.piece_reads.pop(identity, None)
+                if not future.done(): future.cancel()
+
+    async def alerts(self):
+        try:
+            while True:
+                for alert in self.session.pop_alerts():
+                    if isinstance(alert, lt.read_piece_alert):
+                        key = str(alert.handle.info_hashes().get_best())
+                        future = self.piece_reads.get((key, alert.piece))
+                        if future is not None and not future.done():
+                            if alert.error.value():
+                                future.set_exception(IOError('Torrent disk read failed'))
+                            else:
+                                future.set_result(bytes(alert.buffer))
+                    elif isinstance(alert, lt.save_resume_data_alert):
+                        key = str(alert.params.info_hashes.get_best())
+                        target = self.resume / (key+'.resume')
+                        temp = target.with_suffix('.tmp')
+                        temp.write_bytes(lt.write_resume_data_buf(alert.params))
+                        temp.replace(target)
+                        metadata = self.resume / (key+'.torrent')
+                        if alert.params.ti is not None and not metadata.exists():
+                            metadata.write_bytes(lt.bencode(lt.create_torrent(alert.params.ti).generate()))
+                await asyncio.sleep(.05)
+        finally:
+            for future in self.piece_reads.values():
+                if not future.done(): future.cancel()
+            self.piece_reads.clear()
 
     async def maintain(self):
         while True:
@@ -247,7 +328,7 @@ class Torrents:
                         rows = db.execute('SELECT * FROM torrents ORDER BY added').fetchall()
                         reserved = sum(row['size'] for row in rows)
                         requested = sum(h.torrent_file().total_size() for key, h in self.handles.items()
-                                        if h.torrent_file() and not next((r['size'] for r in rows if r['id']==key), 0)
+                                        if key not in self.metadata_only and h.torrent_file() and not next((r['size'] for r in rows if r['id']==key), 0)
                                         and h.torrent_file().total_size() <= self.config['cache_bytes'])
                         for row in rows:
                             if reserved + requested <= self.config['cache_bytes']:
@@ -260,10 +341,14 @@ class Torrents:
                                 del self.handles[key]
                                 db.execute('DELETE FROM torrents WHERE id=?', (key,))
                                 (self.resume / (key+'.resume')).unlink(missing_ok=True)
-                                (self.resume / (key+'.torrent')).unlink(missing_ok=True)
+                                # Retain the small manifest so an evicted source can be reopened without peers.
                                 reserved -= row['size']
                         sizes = {r['id']: r['size'] for r in rows}
                         for key, handle in self.handles.items():
+                            if key in self.metadata_only:
+                                handle.set_upload_mode(True)
+                                if handle.need_save_resume_data(): handle.save_resume_data(lt.save_resume_flags_t.save_info_dict)
+                                continue
                             info = handle.torrent_file()
                             if not info:
                                 continue
@@ -285,13 +370,6 @@ class Torrents:
                                     handle.resume()
                             if handle.need_save_resume_data():
                                 handle.save_resume_data(lt.save_resume_flags_t.save_info_dict)
-                    for alert in self.session.pop_alerts():
-                        if isinstance(alert, lt.save_resume_data_alert):
-                            key = str(alert.params.info_hashes.get_best())
-                            target = self.resume / (key+'.resume')
-                            temp = target.with_suffix('.tmp')
-                            temp.write_bytes(lt.write_resume_data_buf(alert.params))
-                            temp.replace(target)
             except Exception:
                 log.exception('Torrent maintenance failed')
             await asyncio.sleep(5)

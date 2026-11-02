@@ -3,9 +3,11 @@ import asyncio
 import ipaddress
 import socket
 import httpx
+from io import BytesIO
+from PIL import Image
 
 
-async def image_bytes(url):
+async def image_bytes(url, poster=False):
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
         for _ in range(4):
             parsed = httpx.URL(url)
@@ -31,5 +33,19 @@ async def image_bytes(url):
                     if total > 4*1024*1024:
                         raise ValueError('Image too large')
                     chunks.append(chunk)
-                return b''.join(chunks), media
+                data = b''.join(chunks)
+                if poster:
+                    validate_poster(data)
+                return data, media
     raise ValueError('Too many image redirects')
+
+
+def validate_poster(data):
+    try:
+        with Image.open(BytesIO(data)) as image:
+            width, height = image.size
+            if width < 180 or height < 240 or width > height*1.35 or width*height > 25000000:
+                raise ValueError('Not a usable poster')
+            image.verify()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ValueError('Invalid poster') from error

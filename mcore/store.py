@@ -32,6 +32,11 @@ class Store:
                 CREATE INDEX IF NOT EXISTS sync_due ON sync_jobs(kind,due);
                 CREATE TABLE IF NOT EXISTS title_links (alias TEXT, kind TEXT, year TEXT, movie TEXT, PRIMARY KEY(alias,kind,year,movie));
                 CREATE INDEX IF NOT EXISTS title_movie ON title_links(movie);
+                CREATE TABLE IF NOT EXISTS source_files (release TEXT, file INTEGER, data TEXT, PRIMARY KEY(release,file));
+                CREATE TABLE IF NOT EXISTS metadata_only_torrents (torrent TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS source_index_jobs (release TEXT PRIMARY KEY, due REAL, attempts INTEGER DEFAULT 0, error TEXT DEFAULT '', completed REAL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS season_metadata (movie TEXT, season INTEGER, total INTEGER, origin TEXT, PRIMARY KEY(movie,season));
+                CREATE TABLE IF NOT EXISTS external_episodes (movie TEXT, episode TEXT, external_id TEXT, season INTEGER, number INTEGER, PRIMARY KEY(movie,episode));
             ''')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(history)')}
             for name, kind in [('torrent', 'TEXT'), ('file', 'INTEGER')]:

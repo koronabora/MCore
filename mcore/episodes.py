@@ -1,9 +1,15 @@
 """Stable episode identities across releases. Ambiguous files stay release-specific."""
 import re
+import json
 
 
 def identify(name, release):
     normalized = name.replace('\\', '/')
+    film = re.search(r'(?i)(?:фильм|film)\s*[._ -]*(\d{1,3})', normalized)
+    part = re.search(r'(?i)(?:часть|part|серия)\s*[._ -]*(\d{1,3})', normalized)
+    if release.get('cycle') and film:
+        number = int(part[1]) if part else 1
+        return f'film{int(film[1]):03}part{number:03}', int(film[1]), number
     if re.search(r'(?i)S\d+[ ._-]*E\d+(?:[ ._-]+E?\d+|E\d+)', normalized):
         return '', None, None
     match = re.search(r'(?i)\bS(\d{1,3})[ ._-]*E(\d{1,4})(?!\d|[ ._-]*E\d)', normalized)
@@ -24,12 +30,15 @@ def identify(name, release):
 
 
 def register(store, release, torrent, files):
-    if not release.get('series'):
-        return
     with store.connect() as db:
+        db.execute('DELETE FROM source_files WHERE release=?', (release['id'],))
         for file in files:
             episode, season, number = identify(file['name'], release)
+            if not release.get('series'):
+                episode = 'movie' if len(files) == 1 else ''
             episode = episode or f"file:{torrent}:{file['index']}"
+            data = dict(file, episode=episode, season=season, number=number, torrent=torrent, release=release['id'])
+            db.execute('INSERT OR REPLACE INTO source_files VALUES (?,?,?)', (release['id'], file['index'], json.dumps(data)))
             db.execute('INSERT OR REPLACE INTO episode_files VALUES (?,?,?,?,?,?,?,?)',
                        (release['id'], torrent, file['index'], release['movie'], episode, season, number, file['name']))
 
@@ -48,3 +57,47 @@ def listing(store, aliases, uid):
         if key in progress:
             item.update({k: progress[key][k] for k in ('position', 'duration', 'completed')})
     return list(groups.values())
+
+
+def catalog(store, releases, aliases, uid):
+    """Works first; source lists are built only from inspected torrent manifests."""
+    by_release = {r['id']: r for r in releases}
+    placeholders = ','.join('?' for _ in by_release) or 'NULL'
+    movie_placeholders = ','.join('?' for _ in aliases) or 'NULL'
+    with store.connect() as db:
+        rows = db.execute(f'SELECT release,data FROM source_files WHERE release IN ({placeholders})', tuple(by_release)).fetchall()
+        history = db.execute(f'SELECT * FROM episode_history WHERE user=? AND movie IN ({movie_placeholders}) ORDER BY updated', (uid, *aliases)).fetchall()
+        totals = {r['season']: r['total'] for r in db.execute(f'SELECT * FROM season_metadata WHERE movie IN ({movie_placeholders})', aliases)}
+        jobs = {r['release']: dict(r) for r in db.execute(f'SELECT * FROM source_index_jobs WHERE release IN ({placeholders})', tuple(by_release))}
+        external = db.execute(f'SELECT * FROM external_episodes WHERE movie IN ({movie_placeholders})', aliases).fetchall()
+    groups, manifests = {}, {}
+    progress = {r['episode']: dict(r) for r in history if r['movie'] in aliases}
+    latest = max(progress.values(), key=lambda r: r['updated'], default={}).get('episode', '')
+    for row in external:
+        key = row['episode']
+        groups[key] = dict(id=key, season=row['season'], number=row['number'], name=f"Серия {row['number']}", external_id=row['external_id'], sources=[], position=0, completed=False, last_watched=key == latest)
+        if key in progress: groups[key].update({k: progress[key][k] for k in ('position', 'duration', 'completed')})
+    for row in rows:
+        if row['release'] not in by_release:
+            continue
+        file = json.loads(row['data'])
+        manifests.setdefault(row['release'], []).append(file)
+        key = file['episode']
+        item = groups.setdefault(key, dict(id=key, season=file['season'], number=file['number'], name=file['name'], sources=[], position=0, completed=False, last_watched=key == latest))
+        item['sources'].append(file)
+        if key in progress:
+            item.update({k: progress[key][k] for k in ('position', 'duration', 'completed')})
+    # An explicit "episodes 1-N of N" in a single-season release is evidence of the total.
+    for release in releases:
+        season = str(release.get('season', ''))
+        match = re.search(r'(?i)(?:сери[ияй]|episodes?)\s*[: ]*1\s*[-–]\s*(\d+)\s*(?:из|of)\s*(\d+)', release.get('release_title', ''))
+        if season.isdigit() and match and match[1] == match[2] and int(match[2]) <= 1000:
+            totals[int(season)] = max(totals.get(int(season), 0), int(match[2]))
+    complete = {}
+    for rid, files in manifests.items():
+        complete[rid] = [season for season, count in totals.items() if count > 0 and
+                         {f['number'] for f in files if f['season'] == season and f['number'] is not None} >= set(range(1, count+1))]
+    return dict(works=sorted(groups.values(), key=lambda x: (x['season'] if x['season'] is not None else 9999, x['number'] if x['number'] is not None else 9999, x['name'])),
+                complete_seasons=complete, season_totals=totals,
+                indexed_releases=list(manifests), indexing=any(not j['completed'] and j['attempts'] < 3 for j in jobs.values()),
+                index_errors={rid: j['error'] for rid, j in jobs.items() if j['error']})

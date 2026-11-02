@@ -65,7 +65,8 @@ def normalize(provider, row):
         aliases.append(translated[1].strip(' -/'))
     original = next((a for a in aliases if re.search('[a-z]', a, re.I) and not re.search('[а-яё]', a, re.I)), clean)
     canonical = title_key(original)
-    series = bool(season) or bool(row.get('series')) or bool(re.search(r'(?i)\[TV\]|\bсериал\b|\b\d+\s+сери[яий]', title))
+    cycle = bool(re.search(r'(?i)цикл фильмов|сборник фильмов|фильмы\s*[: ]*\d+\s*[-–]\s*\d+', title))
+    series = cycle or bool(season) or bool(row.get('series')) or bool(re.search(r'(?i)\[TV\]|\bсериал\b|\b\d+\s+сери[яий]', title))
     anime = bool(re.search(r'(?i)\[TV\]|\bаниме\b|сёнэн', title))
     # Unknown year is deliberately not merged across sources.
     identity = canonical + ':' + ('anime-series' if series and anime else 'series' if series else year[0] if year else provider + ':' + rid)
@@ -76,8 +77,8 @@ def normalize(provider, row):
             'title_aliases': aliases,
             'provider': provider, 'source_id': rid, 'title': clean, 'release_title': title,
             'year': year[0] if year else '', 'director': '', 'description': '', 'poster': '',
-            'resolution': resolution[1] + ('i' if resolution[0].lower().endswith('i') else 'p') if resolution else dimensions[0] if dimensions else '2160p' if re.search(r'(?i)\b(?:4K|UHD)\b', title) else source[0] + ' · разрешение не указано' if source else 'Разрешение не указано',
-            'series': series, 'season': next((g for g in season.groups() if g), '') if season else '',
+            'resolution': resolution[1] + ('i' if resolution[0].lower().endswith('i') else 'p') if resolution else dimensions[0] if dimensions else '2160p' if re.search(r'(?i)\b(?:4K|UHD)\b', title) else 'N\\A',
+            'series': series, 'cycle': cycle, 'season': next((g for g in season.groups() if g), '') if season else '',
             'size': str(row.get('Size') or row.get('size') or ''),
             'seeds': number(row.get('Seeds', row.get('seeds', 0))),
             'peers': number(row.get('Peers', row.get('peers', 0))),
@@ -145,7 +146,7 @@ class Catalog:
                 for field in ('metadata_at', 'dimensions', 'torrent_id', 'external_ids', 'screenshots_at', 'detail_series'):
                     if field not in item and field in old:
                         item[field] = old[field]
-                if item.get('dimensions') and 'не указано' in item['resolution']:
+                if item.get('dimensions') and ('не указано' in item['resolution'].lower() or item['resolution'] == 'N\\A'):
                     item['resolution'] = item['dimensions']
             before = item['movie']
             kind = 'anime' if re.search(r'(?i)\[TV\]|\bаниме\b|сёнэн', item['release_title']) else 'series' if item.get('series') else 'film'
@@ -250,6 +251,7 @@ class Catalog:
             grouped[mid]['score'] = max(grouped[mid]['score'], score)
             grouped[mid]['exact'] |= exact
             grouped[mid]['keyword_match'] |= keyword_match
+            grouped[mid]['animated'] = grouped[mid].get('animated', False) or self.animated(item)
             for field in ('description', 'director'):
                 if not grouped[mid][field] and item.get(field):
                     grouped[mid][field] = item[field]
@@ -258,7 +260,14 @@ class Catalog:
 
     @staticmethod
     def public(item):
-        return {k: v for k, v in item.items() if k not in ('magnet', 'poster', 'screenshots', 'download', 'torrent_data', 'search_queries')}
+        result = {k: v for k, v in item.items() if k not in ('magnet', 'poster', 'screenshots', 'download', 'torrent_data', 'search_queries')}
+        if not result.get('resolution') or 'не указано' in result['resolution'].lower(): result['resolution'] = item.get('dimensions') or 'N\\A'
+        result['animated'] = Catalog.animated(item)
+        return result
+
+    @staticmethod
+    def animated(item):
+        return bool(item.get('animated') or re.search(r'(?i)мульт|animation|animated|аниме|\[TV\]', item.get('release_title', '')+' '+item.get('description', '')))
 
     def release(self, rid):
         with self.store.connect() as db:
@@ -355,7 +364,7 @@ class Catalog:
                     break
         items = self.movie_releases(mid)
         best = max(items, key=lambda i: len(i.get('description', '')))
-        return {'id': mid, **{k: best[k] for k in ('title', 'year', 'director', 'description')},
+        return {'id': mid, 'series': any(i.get('series') for i in items), 'animated': any(self.animated(i) for i in items), **{k: best[k] for k in ('title', 'year', 'director', 'description')},
                 'releases': [self.public(i) | {'swarm_stale': i['provider'] != 'local' and i.get('checked_at', 0) < refresh_started}
                              for i in sorted(items, key=lambda i: (i.get('season', ''), -i.get('seeds', 0)))],
                 'swarm_refresh_failed': failed,

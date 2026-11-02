@@ -37,12 +37,13 @@ params.flags &= ~lt.torrent_flags.paused
 resume = Path(config['state_dir']) / 'resume'
 resume.mkdir(exist_ok=True)
 (resume/(key+'.resume')).write_bytes(lt.write_resume_data_buf(params))
+(resume/(key+'.torrent')).write_bytes(lt.bencode(torrent.generate()))
 magnet = lt.make_magnet_uri(info)
 with store.connect() as db:
     db.execute('INSERT OR REPLACE INTO torrents VALUES (?,?,?,?)', (key, magnet, time.time(), video.stat().st_size))
 catalog = Catalog(store, config)
 release = normalize('local', {'Name': 'MCore demo (2026) 720p', 'Id': '1', 'Seeds': 1, 'Size': f'{video.stat().st_size/1024**2:.1f} MiB'})
-release.update(magnet=magnet, director='MCore / ffmpeg', description='Синтетический 30-секундный тестовый ролик. Создан локально для проверки воспроизведения, перемотки и скачивания.', audio='AAC · тестовый звуковой сигнал')
+release.update(magnet=magnet, torrent_id=key, director='MCore / ffmpeg', description='Синтетический 30-секундный тестовый ролик. Создан локально для проверки воспроизведения, перемотки и скачивания.', audio='AAC · тестовый звуковой сигнал')
 catalog.put(release)
 asyncio.run(catalog.client.aclose())
 print('Installed local test movie:', release['movie'])

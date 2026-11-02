@@ -18,6 +18,7 @@ from .torrents import Torrents, byte_range
 from .images import image_bytes
 from .inspection import Inspection
 from . import episodes
+from .source_index import SourceIndex
 
 
 @asynccontextmanager
@@ -27,7 +28,10 @@ async def lifespan(app):
     app.state.catalog = Catalog(app.state.store, config)
     app.state.torrents = Torrents(app.state.store, config)
     app.state.inspection = Inspection(app.state.torrents, config['state_dir'])
-    tasks = [asyncio.create_task(app.state.catalog.synchronize()), asyncio.create_task(app.state.torrents.maintain())]
+    async def index_start(rid):
+        return (await start(Start(release=rid), uid='indexer'))['id']
+    app.state.source_index = SourceIndex(app.state.store, app.state.catalog, app.state.torrents, index_start)
+    tasks = [asyncio.create_task(app.state.catalog.synchronize()), asyncio.create_task(app.state.torrents.maintain()), asyncio.create_task(app.state.torrents.alerts()), asyncio.create_task(app.state.source_index.run())]
     yield
     for task in tasks:
         task.cancel()
@@ -37,7 +41,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.2', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.3.4', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -126,6 +130,26 @@ async def movie(mid: str, uid=Depends(user)):
     if result['resume']:
         result['resume']['release'] = next((i['id'] for i in app.state.catalog.movie_releases(mid) if i.get('torrent_id') == row['torrent']), '')
     result['episodes'] = episodes.listing(app.state.store, aliases, uid)
+    releases = app.state.catalog.movie_releases(mid)
+    app.state.source_index.schedule(releases)
+    for release in releases:
+        key = release.get('torrent_id')
+        if key in app.state.torrents.handles:
+            files = app.state.torrents.files(key)
+            if files:
+                episodes.register(app.state.store, release, key, files)
+    result.update(episodes.catalog(app.state.store, releases, aliases, uid))
+    return result
+
+
+@app.get('/v1/movies/{mid}/sources')
+def movie_sources(mid: str, uid=Depends(user)):
+    releases = app.state.catalog.movie_releases(mid)
+    if not releases:
+        raise HTTPException(404, 'Movie not found')
+    aliases = list({mid, *(r['movie'] for r in releases), *(a for r in releases for a in r.get('movie_aliases', []))})
+    result = episodes.catalog(app.state.store, releases, aliases, uid)
+    result['releases'] = [app.state.catalog.public(r) for r in releases]
     return result
 
 
@@ -155,7 +179,8 @@ def home(uid=Depends(user)):
                 if identity in seen:
                     continue
                 seen.add(identity)
-                history.append({'id': row['movie'], 'title': item['title'], 'year': item['year'], 'position': row['position']})
+                history.append({'id': row['movie'], 'title': item['title'], 'year': item['year'], 'director': item.get('director',''),
+                                'series': item.get('series',False), 'animated': any(app.state.catalog.animated(r) for r in releases), 'position': row['position']})
     return {'queries': queries, 'history': history}
 
 
@@ -175,7 +200,7 @@ async def poster(mid: str, uid=Depends(user)):
     content = None
     for candidate in urls[:3]:
         try:
-            content, media_type = await image_bytes(candidate)
+            content, media_type = await image_bytes(candidate, poster=True)
             break
         except (ValueError, OSError, httpx.HTTPError):
             continue
@@ -261,11 +286,12 @@ async def start(body: Start, uid=Depends(user)):
     async with lock:
         cached = app.state.catalog.release(body.release)
         if cached and cached.get('torrent_id') in app.state.torrents.handles:
+            if uid != 'indexer': app.state.torrents.activate(cached['torrent_id'])
             return {'id': cached['torrent_id']}
-        return await start_release(body)
+        return await start_release(body, metadata_only=uid == 'indexer')
 
 
-async def start_release(body):
+async def start_release(body, metadata_only=False):
     release = await app.state.catalog.detail(body.release)
     if not release:
         raise HTTPException(404, 'Release not found')
@@ -283,7 +309,7 @@ async def start_release(body):
             source = await app.state.catalog.jackett.download(release['download'])
         if not source:
             raise HTTPException(409, detail={'code': 'source_missing', 'message': 'Источник не предоставил torrent или magnet. Выберите другую раздачу.'})
-        key = await app.state.torrents.add(source)
+        key = await app.state.torrents.add(source, metadata_only=metadata_only)
         release['torrent_id'] = key
         app.state.catalog.put(release)
     except httpx.HTTPError:
