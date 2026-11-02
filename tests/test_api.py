@@ -218,6 +218,12 @@ def test_real_local_torrent_transfer_and_http_ranges(client, tmp_path, monkeypat
         while not download.status().is_seeding and time.monotonic()<deadline:
             time.sleep(.1)
         assert download.status().is_seeding, str(download.status().errc)
+        from mcore.telemetry import snapshot
+        observed = next(r for r in snapshot(app.state.torrents)['torrents'] if r['id'] == key)
+        assert observed['name'] == 'sample.mkv'
+        assert observed['percent'] == 100 and observed['size'] == len(payload)
+        assert observed['download_rate'] >= 0 and observed['upload_rate'] >= 0
+        assert observed['uploaded'] >= 0
         path = f'/v1/torrents/{key}/files/0'
         status = client.get(f'/v1/torrents/{key}', headers=auth)
         assert status.status_code == 200, status.text

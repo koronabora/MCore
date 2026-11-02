@@ -18,6 +18,7 @@ from .torrents import Torrents, byte_range
 from .images import image_bytes
 from .inspection import Inspection
 from . import episodes
+from . import telemetry
 from .source_index import SourceIndex
 
 
@@ -31,7 +32,7 @@ async def lifespan(app):
     async def index_start(rid):
         return (await start(Start(release=rid), uid='indexer'))['id']
     app.state.source_index = SourceIndex(app.state.store, app.state.catalog, app.state.torrents, index_start)
-    tasks = [asyncio.create_task(app.state.catalog.synchronize()), asyncio.create_task(app.state.torrents.maintain()), asyncio.create_task(app.state.torrents.alerts()), asyncio.create_task(app.state.source_index.run())]
+    tasks = [asyncio.create_task(app.state.catalog.synchronize()), asyncio.create_task(app.state.torrents.maintain()), asyncio.create_task(app.state.torrents.alerts()), asyncio.create_task(app.state.source_index.run()), asyncio.create_task(telemetry.publish(app.state.torrents, config['state_dir']))]
     yield
     for task in tasks:
         task.cancel()
