@@ -191,7 +191,7 @@ class Torrents:
             raise ValueError('Unsafe torrent file path')
         return handle, info, path, files.file_size(index), files.file_offset(index)
 
-    def status(self, key, index=0, seconds=15, position=0):
+    def status(self, key, index=0, seconds=180, position=0, percent=10):
         handle = self.handles[key]
         self.last_used[key] = time.monotonic()
         status = handle.status()
@@ -207,21 +207,23 @@ class Torrents:
             # VBR needs a margin; actual decoder reads remain authoritative after seeking.
             rate = size/duration if duration else 1024*1024
             start = max(0, min(size-1, int(max(0, position/1000-2)*rate))) if duration else 0
-            target = min(size-start, max(1024*1024, math.ceil((seconds+2)*rate*1.25)) if duration else max(4*1024*1024, seconds*1024*1024))
+            target = min(size-start, max(math.ceil(size*percent/100), max(1024*1024, math.ceil((seconds+2)*rate*1.25)) if duration else max(4*1024*1024, seconds*1024*1024)))
             first, last = (offset+start)//info.piece_length(), (offset+start+target-1)//info.piece_length()
             wanted = set(range(first, last+1))
             # Header pieces are also required for a resumed decoder to reopen the container.
-            wanted.update(range(offset//info.piece_length(), (offset+min(size, 1024*1024)-1)//info.piece_length()+1))
+            container = set(range(offset//info.piece_length(), (offset+min(size, 1024*1024)-1)//info.piece_length()+1))
             # AVI/OpenDML and MP4 indexes can span several pieces, not just the last one.
             tail_first = (offset+max(0, size-8*1024*1024)) // info.piece_length()
             tail_last = (offset+size-1) // info.piece_length()
-            wanted.update(range(tail_first, tail_last+1))
+            container.update(range(tail_first, tail_last+1))
+            wanted.update(container)
             missing = 0
             for piece in sorted(wanted):
                 if size and not handle.have_piece(piece):
                     handle.set_piece_deadline(piece, 0)
                     missing += info.piece_size(piece)
-            result['ready'] = missing == 0 and size > 0 and duration > 0
+            result['index_ready'] = duration > 0 and all(handle.have_piece(piece) for piece in container)
+            result['ready'] = missing == 0 and size > 0 and result['index_ready']
             total = sum(info.piece_size(piece) for piece in wanted)
             result['buffer_percent'] = min(100 if duration else 99, round(100*(total-missing)/max(1,total)))
             result['buffer_eta'] = round(missing / status.download_payload_rate) if status.download_payload_rate else None

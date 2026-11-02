@@ -42,7 +42,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.3.9', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.4.2', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -330,9 +330,9 @@ async def start_release(body, metadata_only=False):
 
 
 @app.get('/v1/torrents/{key}')
-async def status(key: str, file: int = Query(default=0, ge=0), buffer: int = Query(default=15, ge=1, le=120), position: int = Query(default=0, ge=0, le=604800000), uid=Depends(user)):
+async def status(key: str, file: int = Query(default=0, ge=0), buffer: int = Query(default=180, ge=1, le=900), position: int = Query(default=0, ge=0, le=604800000), percent: int = Query(default=10, ge=1, le=100), uid=Depends(user)):
     try:
-        result = app.state.torrents.status(key, file, buffer, position)
+        result = app.state.torrents.status(key, file, buffer, position, percent)
         if result.get('metadata_ready') and not result['files']:
             result['error'] = 'В раздаче нет поддерживаемых видеофайлов. Для образов дисков и папок Blu-ray выберите другую раздачу (например, MKV или MP4).'
         if result['files']:

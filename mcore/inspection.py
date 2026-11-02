@@ -155,7 +155,7 @@ class Inspection:
         if not files:
             raise ValueError('No cached video')
         file = max(files, key=lambda f: f['size'])
-        self.torrents.status(key, file['index'])  # Protect the source against eviction while in use.
+        self.torrents.status(key, file['index'], seconds=15, percent=0)  # Screenshot probing is not a playback startup request.
         metadata = await self.metadata(key, file['index'])
         duration = float(metadata.get('format', {}).get('duration', 0))
         position = max(0, duration*(index+1)/4)

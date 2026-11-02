@@ -146,11 +146,11 @@ def test_buffer_requires_entire_index_window(client, monkeypatch):
     monkeypatch.setattr(manager, 'files', lambda _: [])
     monkeypatch.setattr(manager, 'file', lambda *_: (handle, info, None, 64*1024*1024, 0))
     try:
-        assert not manager.status('index-test')['ready']
+        assert not manager.status('index-test', seconds=15)['ready']
         available.update(range(56, 64))
-        assert not manager.status('index-test')['ready']
+        assert not manager.status('index-test', seconds=15)['ready']
         manager.media_info[('index-test', 0)] = {'duration_ms': 128000}
-        assert manager.status('index-test')['ready']
+        assert manager.status('index-test', seconds=15)['ready']
     finally:
         del manager.handles['index-test']
 
