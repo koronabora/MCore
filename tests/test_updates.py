@@ -14,6 +14,7 @@ def test_update_publication_auth_and_immutable_download(tmp_path, monkeypatch):
     auth = {'Authorization': 'Bearer valid'}
     assert client.get('/v1/app-update').status_code == 401
     assert client.get('/v1/app-update', headers=auth).json() == {'version_code': 0}
+    assert client.get('/').status_code == 404
     root = updates.directory(tmp_path)
     root.mkdir()
     payload = b'fixture-apk-bytes'
@@ -23,10 +24,22 @@ def test_update_publication_auth_and_immutable_download(tmp_path, monkeypatch):
     assert client.get('/v1/app-update', headers=auth).status_code == 503
     (root/(digest+'.apk')).write_bytes(payload)
     assert client.get('/v1/app-update', headers=auth).json() == release
+    public = client.get('/')
+    assert public.status_code == 200 and public.content == payload
+    assert 'MApp-0.5.apk' in public.headers['content-disposition']
+    assert public.headers['cache-control'] == 'no-store'
     assert client.get('/v1/app-update/'+digest+'.apk').status_code == 401
     response = client.get('/v1/app-update/'+digest+'.apk', headers=auth)
     assert response.content == payload and response.status_code == 200
     assert client.get('/v1/app-update/not-a-hash.apk', headers=auth).status_code == 404
+    newer = b'newer-fixture-apk'
+    newer_hash = hashlib.sha256(newer).hexdigest()
+    (root/(newer_hash+'.apk')).write_bytes(newer)
+    release.update(version_code=22, version_name='0.5.1', sha256=newer_hash, size=len(newer))
+    (root/'latest.json').write_text(json.dumps(release))
+    public = client.get('/')
+    assert public.content == newer and 'MApp-0.5.1.apk' in public.headers['content-disposition']
+    assert client.get('/v1/app-update/'+digest+'.apk', headers=auth).content == payload
     release['sha256'] = '../secret'
     (root/'latest.json').write_text(json.dumps(release))
     assert client.get('/v1/app-update', headers=auth).status_code == 503

@@ -101,6 +101,17 @@ def app_update(uid=Depends(user)):
     return updates.latest(app.state.catalog.config['state_dir'])
 
 
+@app.get('/')
+def download_latest_app():
+    state_dir = app.state.catalog.config['state_dir']
+    release = updates.latest(state_dir)
+    if not release['version_code']:
+        raise HTTPException(404, 'No APK published yet')
+    version = re.sub(r'[^a-zA-Z0-9._-]', '_', release['version_name'])
+    return FileResponse(updates.artifact(state_dir, release['sha256']),
+                        media_type='application/vnd.android.package-archive', filename=f'MApp-{version}.apk')
+
+
 @app.get('/v1/app-update/{digest}.apk')
 def app_update_apk(digest: str, uid=Depends(user)):
     return FileResponse(updates.artifact(app.state.catalog.config['state_dir'], digest),
