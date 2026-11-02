@@ -52,7 +52,7 @@ def test_tracker_details_extract_only_release_metadata():
     assert kz['description'] == 'Описание фильма.' and kz['director'] == 'Автор'
 
 
-def test_open_card_returns_new_swarm_counts_and_marks_missing_releases(tmp_path):
+def test_open_card_does_not_wait_for_trackers_and_availability_is_live_only(tmp_path):
     async def check():
         catalog = Catalog(Store(tmp_path), {'providers': ['kinozal'], 'torapi_url': 'http://localhost:1'})
         item = normalize('kinozal', {'Id': '1', 'Title': 'Example (2024) 1080p', 'Seeds': 1})
@@ -60,23 +60,29 @@ def test_open_card_returns_new_swarm_counts_and_marks_missing_releases(tmp_path)
         missing = dict(item, id='kinozal:2', source_id='2')
         catalog.put(item); catalog.put(missing)
         calls = []
+        blocked = asyncio.Event()
         async def refresh(provider, query):
             calls.append((provider, query))
+            await blocked.wait()
             updated = dict(item, seeds=12, checked_at=__import__('time').time())
             catalog.put(updated)
+            catalog.remember_availability(updated)
         catalog.provider_search = refresh
         try:
+            result = await asyncio.wait_for(catalog.movie(item['movie']),0.2)
+            by_id = {r['id']: r for r in result['releases']}
+            assert not by_id[item['id']]['availability_known']
+            assert by_id[missing['id']]['swarm_stale']
+            await catalog.movie(item['movie'])
+            blocked.set()
+            await asyncio.gather(*catalog.refresh_tasks)
             result = await catalog.movie(item['movie'])
             by_id = {r['id']: r for r in result['releases']}
-            assert calls == [('kinozal', 'Example')]
-            assert by_id[item['id']]['seeds'] == 12 and not by_id[item['id']]['swarm_stale']
-            assert by_id[missing['id']]['swarm_stale']
-            async def unavailable(*_):
-                return 'kinozal'
-            catalog.provider_search = unavailable
-            result = await catalog.movie(item['movie'])
-            assert result['swarm_refresh_failed'] == ['kinozal']
-            assert all(r['swarm_stale'] for r in result['releases'])
+            assert calls == [('kinozal','Example')]
+            assert by_id[item['id']]['seeds'] == 12 and by_id[item['id']]['availability_known']
+            assert not by_id[missing['id']]['availability_known']
+            catalog.availability.clear()  # Restart cannot turn persisted old counters into current availability.
+            assert not catalog.source_public(catalog.release(item['id']))['availability_known']
         finally:
             await catalog.close()
     asyncio.run(check())

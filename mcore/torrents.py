@@ -87,6 +87,8 @@ class Torrents:
         with store.connect() as db:
             rows = db.execute('SELECT * FROM torrents').fetchall()
         for row in rows:
+            if row['id'] in self.metadata_only:
+                continue  # Durable manifests stay on disk; background indexing must not retain every swarm.
             try:
                 path = self.resume / (row['id'] + '.resume')
                 metadata = self.resume / (row['id'] + '.torrent')
@@ -168,6 +170,23 @@ class Torrents:
             self.metadata_only.remove(key)
             with self.store.connect() as db:
                 db.execute('DELETE FROM metadata_only_torrents WHERE torrent=?', (key,))
+
+    def release_metadata(self, key):
+        if key not in self.metadata_only or self.active.get(key):
+            return
+        handle = self.handles.get(key)
+        if handle is None:
+            return
+        info = handle.torrent_file()
+        if info:
+            target = self.resume/(key+'.torrent')
+            temporary = target.with_suffix('.torrent.tmp')
+            temporary.write_bytes(lt.bencode(lt.create_torrent(info).generate()))
+            temporary.replace(target)
+        self.session.remove_torrent(handle)
+        self.handles.pop(key, None)
+        self.last_used.pop(key, None)
+        self.errors.pop(key, None)
 
     def files(self, key):
         handle = self.handles[key]

@@ -43,7 +43,7 @@ async def lifespan(app):
     app.state.torrents.session.pause()
 
 
-app = FastAPI(title='MCore', version='0.4.2', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app = FastAPI(title='MCore', version='0.5.1', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 attempts = defaultdict(deque)
 
 
@@ -127,18 +127,11 @@ async def search(q: str = Query(min_length=1, max_length=150), live: bool = True
     if live:
         with app.state.store.connect() as db:
             db.execute('INSERT OR REPLACE INTO queries VALUES (?,?,?)', (uid, q, time.time()))
-    async def refresh(provider):
-        from .catalog import title_key
-        normalized = title_key(q)
-        variants = list(dict.fromkeys([normalized, re.sub(r'\s+', '-', normalized)])) if len(normalized.split()) == 2 else [normalized]
-        try:
-            outcomes = await asyncio.wait_for(asyncio.gather(*(catalog.provider_search(provider, value) for value in variants)), 25)
-            return provider if all(outcomes) else None
-        except TimeoutError:
-            return provider
-    errors = await asyncio.gather(*(refresh(p) for p in catalog.config['providers'])) if live else []
-    # Suggestions must not wait for tracker detail pages. Posters hydrate independently.
-    return {'movies': catalog.movies(q), 'unavailable_providers': [e for e in errors if e]}
+    if live:
+        catalog.refresh_search(q)
+    movies = await asyncio.to_thread(catalog.movies, q)
+    refreshing = q in catalog.search_refresh and not catalog.search_refresh[q][1].done()
+    return {'movies': movies, 'unavailable_providers': [], 'refreshing': refreshing}
 
 
 @app.get('/v1/movies/{mid}')
@@ -158,26 +151,34 @@ async def movie(mid: str, uid=Depends(user)):
     result['episodes'] = episodes.listing(app.state.store, aliases, uid)
     releases = app.state.catalog.movie_releases(mid)
     app.state.source_index.schedule(releases)
-    for release in releases:
-        key = release.get('torrent_id')
-        if key in app.state.torrents.handles:
-            files = app.state.torrents.files(key)
-            if files:
-                episodes.register(app.state.store, release, key, files)
     result.update(episodes.catalog(app.state.store, releases, aliases, uid))
-    result['releases'] = [app.state.catalog.public(r) for r in releases]
+    result['releases'] = [app.state.catalog.source_public(r) for r in releases]
+    result['sources_version'] = episodes.version(app.state.store, releases, aliases, uid)
     return result
 
 
 @app.get('/v1/movies/{mid}/sources')
-def movie_sources(mid: str, uid=Depends(user)):
+async def movie_sources(mid: str, since: str = '', uid=Depends(user)):
     releases = app.state.catalog.movie_releases(mid)
     if not releases:
         raise HTTPException(404, 'Movie not found')
+    catalog = app.state.catalog
+    catalog.background(mid, catalog.movie_refresh, lambda: catalog.refresh_movie(mid))
     aliases = list({mid, *(r['movie'] for r in releases), *(a for r in releases for a in r.get('movie_aliases', []))})
-    result = episodes.catalog(app.state.store, releases, aliases, uid)
-    result['releases'] = [app.state.catalog.public(r) for r in releases]
+    version = episodes.version(app.state.store, releases, aliases, uid)
+    result = {'unchanged': True, 'indexing': episodes.pending(app.state.store,releases)} if since == version else episodes.catalog(app.state.store, releases, aliases, uid)
+    if since == version:
+        result['availability'] = [{k:v for k,v in app.state.catalog.source_public(r).items() if k in ('id','seeds','peers','availability_known','availability_checked_at','swarm_stale')} for r in releases]
+    else:
+        result['releases'] = [app.state.catalog.source_public(r) for r in releases]
+    result['sources_version'] = version
     return result
+
+
+@app.get('/v1/index-status')
+def index_status(uid=Depends(user)):
+    from .sync import Synchronizer
+    return Synchronizer(app.state.catalog).progress()
 
 
 @app.get('/v1/library/match')

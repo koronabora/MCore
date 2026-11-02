@@ -1,6 +1,7 @@
 """Stable episode identities across releases. Ambiguous files stay release-specific."""
 import re
 import json
+import hashlib
 
 
 def identify(name, release):
@@ -46,6 +47,7 @@ def identify(name, release):
 def register(store, release, torrent, files):
     with store.connect() as db:
         db.execute('DELETE FROM source_files WHERE release=?', (release['id'],))
+        db.execute('DELETE FROM episode_files WHERE release=?', (release['id'],))
         for file in files:
             episode, season, number = identify(file['name'], release)
             if not release.get('series') and not episode:
@@ -55,6 +57,28 @@ def register(store, release, torrent, files):
             db.execute('INSERT OR REPLACE INTO source_files VALUES (?,?,?)', (release['id'], file['index'], json.dumps(data)))
             db.execute('INSERT OR REPLACE INTO episode_files VALUES (?,?,?,?,?,?,?,?)',
                        (release['id'], torrent, file['index'], release['movie'], episode, season, number, file['name']))
+        db.execute('INSERT INTO source_versions(release,revision) VALUES (?,1) ON CONFLICT(release) DO UPDATE SET revision=revision+1', (release['id'],))
+
+
+def version(store, releases, aliases, uid):
+    ids = tuple(r['id'] for r in releases)
+    marks = ','.join('?' for _ in ids) or 'NULL'
+    movies = ','.join('?' for _ in aliases) or 'NULL'
+    with store.connect() as db:
+        revisions = [tuple(r) for r in db.execute(f'SELECT release,revision FROM source_versions WHERE release IN ({marks}) ORDER BY release', ids)]
+        history = [tuple(r) for r in db.execute(f'SELECT movie,episode,updated FROM episode_history WHERE user=? AND movie IN ({movies}) ORDER BY movie,episode', (uid,*aliases))]
+        totals = [tuple(r) for r in db.execute(f'SELECT * FROM season_metadata WHERE movie IN ({movies}) ORDER BY movie,season', aliases)]
+        external = [tuple(r) for r in db.execute(f'SELECT * FROM external_episodes WHERE movie IN ({movies}) ORDER BY movie,episode', aliases)]
+    stable = [{k:v for k,v in r.items() if k not in ('seeds','peers','checked_at','metadata_at','screenshots_at','search_queries')} for r in sorted(releases,key=lambda r:r['id'])]
+    return hashlib.sha256(json.dumps([stable,revisions,history,totals,external],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+def pending(store, releases):
+    ids = tuple(r['id'] for r in releases)
+    with store.connect() as db:
+        rows = db.execute('SELECT completed,due FROM source_index_jobs WHERE release IN ('+(','.join('?' for _ in ids) or 'NULL')+')', ids).fetchall()
+    import time
+    return any(not r['completed'] and r['due'] <= time.time()+5 for r in rows)
 
 
 def listing(store, aliases, uid):
@@ -135,5 +159,5 @@ def catalog(store, releases, aliases, uid):
                          {f['number'] for f in files if f['season'] == season and f['number'] is not None} >= set(range(1, count+1))]
     return dict(works=sorted(groups.values(), key=lambda x: (x['season'] if x['season'] is not None else 9999, x['number'] if x['number'] is not None else 9999, x['name'])),
                 complete_seasons=complete, season_totals=totals,
-                indexed_releases=list(manifests), indexing=any(not j['completed'] and j['attempts'] < 3 for j in jobs.values()),
+                indexed_releases=list(manifests), indexing=pending(store, releases),
                 index_errors={rid: j['error'] for rid, j in jobs.items() if j['error']})

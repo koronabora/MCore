@@ -24,7 +24,12 @@ class SourceIndex:
             while True:
                 now = time.time()
                 with self.store.connect() as db:
-                    rows = db.execute('SELECT * FROM source_index_jobs WHERE completed=0 AND attempts<3 AND due<=? ORDER BY due', (now,)).fetchall()
+                    candidates = {r['release']: r for r in db.execute('SELECT * FROM source_index_jobs WHERE completed=0 AND due<=? ORDER BY due LIMIT 128', (now,))}
+                    requested = [rid for rid, value in self.requested.items() if value[0] > now-300]
+                    if requested:
+                        for row in db.execute('SELECT * FROM source_index_jobs WHERE completed=0 AND due<=? AND release IN ('+','.join('?' for _ in requested)+')', (now,*requested)):
+                            candidates[row['release']] = row
+                    rows = list(candidates.values())
                 def priority(row):
                     requested, seeds = self.requested.get(row['release'], (0, 0))
                     return (requested <= now-300, -seeds if requested > now-300 else 0, row['due'])
@@ -49,6 +54,7 @@ class SourceIndex:
 
     async def index(self, job):
         rid = job['release']
+        key = None
         try:
             # Include tracker/download waits in a bounded per-release budget.
             key = await asyncio.wait_for(self.start(rid), timeout=90)
@@ -65,4 +71,7 @@ class SourceIndex:
         except Exception as error:
             with self.store.connect() as db:
                 db.execute('UPDATE source_index_jobs SET attempts=attempts+1,due=?,error=? WHERE release=?',
-                           (time.time()+300, str(error)[:200] or type(error).__name__, rid))
+                           (time.time()+min(86400, 300*2**min(job['attempts'],9)), str(error)[:200] or type(error).__name__, rid))
+        finally:
+            if key and hasattr(self.torrents, 'release_metadata'):
+                self.torrents.release_metadata(key)

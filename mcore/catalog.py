@@ -96,6 +96,9 @@ class Catalog:
         self.metadata = Metadata(config['jackett']) if self.jackett else None
         self.detail_locks = {}
         self.refresh_tasks = set()
+        self.movie_refresh = {}
+        self.search_refresh = {}
+        self.availability = {}
         with store.connect() as db:
             existing = [json.loads(row['data']) for row in db.execute('SELECT data FROM releases')]
             # Reindex as one transaction; thousands of individual fsyncs delay API startup.
@@ -123,6 +126,20 @@ class Catalog:
                     if self.enabled(item):
                         self.put(item, db)
                 db.execute("INSERT INTO sync_state VALUES ('identity-reconcile-031','done')")
+            if not db.execute("SELECT 1 FROM sync_state WHERE key='search-index-051'").fetchone():
+                db.execute('DELETE FROM release_search')
+                db.execute('DELETE FROM release_search_keys')
+                for row in db.execute('SELECT data FROM releases').fetchall():
+                    item = json.loads(row['data'])
+                    row_id = db.execute('INSERT INTO release_search(release,terms) VALUES (?,?)', (item['id'], self.search_terms(item))).lastrowid
+                    db.execute('INSERT INTO release_search_keys VALUES (?,?)', (item['id'],row_id))
+                db.execute("INSERT INTO sync_state VALUES ('search-index-051','done')")
+            # Backfill the durable metadata queue, including releases never opened by a user.
+            for row in db.execute('SELECT data FROM releases').fetchall():
+                item = json.loads(row['data'])
+                if self.enabled(item):
+                    db.execute('INSERT OR IGNORE INTO source_index_jobs(release,due,completed) VALUES (?,?,CASE WHEN EXISTS(SELECT 1 FROM source_files WHERE release=?) THEN ? ELSE 0 END)',
+                               (item['id'], time.time(), item['id'], time.time()))
 
     async def close(self):
         for task in self.refresh_tasks:
@@ -192,6 +209,15 @@ class Catalog:
             item['description'] = clean_description(item.get('description', ''))
             db.execute('INSERT OR REPLACE INTO releases VALUES (?,?,?,?)',
                        (item['id'], item['movie'], json.dumps(item, ensure_ascii=False), time.time()))
+            if not prior or self.search_terms(old) != self.search_terms(item):
+                db.execute('DELETE FROM release_search WHERE rowid=(SELECT row_id FROM release_search_keys WHERE release=?)', (item['id'],))
+                row_id = db.execute('INSERT INTO release_search(release,terms) VALUES (?,?)', (item['id'], self.search_terms(item))).lastrowid
+                db.execute('INSERT OR REPLACE INTO release_search_keys VALUES (?,?)', (item['id'],row_id))
+            if self.enabled(item):
+                db.execute('INSERT OR IGNORE INTO source_index_jobs(release,due) VALUES (?,?)', (item['id'], time.time()))
+                # Changed torrent identity or contents require a new manifest; counters do not.
+                if prior and any(item.get(k) != old.get(k) for k in ('magnet', 'torrent_id', 'size', 'release_title')):
+                    db.execute("UPDATE source_index_jobs SET completed=0,attempts=0,due=?,error='' WHERE release=?", (time.time(), item['id']))
             for alias in aliases:
                 db.execute('INSERT OR IGNORE INTO title_links VALUES (?,?,?,?)', (alias, kind, year, item['movie']))
             for alias in strong:
@@ -213,6 +239,7 @@ class Catalog:
                                 item.update(download=row['download'], description=row['description'], poster=row['poster'],
                                             search_queries=[query.casefold()] if query else [])
                                 self.put(item, db)
+                                self.remember_availability(item)
                     return None
                 response = await self.client.get('/api/search/title/' + provider, params={'query': query})
                 if response.status_code == 400:
@@ -225,17 +252,31 @@ class Catalog:
                     item = normalize(provider, row)
                     if item:
                         self.put(item)
+                        self.remember_availability(item)
             return None
         except (httpx.HTTPError, ValueError, TypeError):
             log.warning('Provider search unavailable: %s', provider)
             return provider
 
+    @staticmethod
+    def search_terms(item):
+        return title_key(' '.join(item.get('title_aliases', [])+[item['title']]+item.get('search_queries', [])))
+
     def movies(self, query=''):
-        with self.store.connect() as db:
-            rows = db.execute('SELECT data FROM releases ORDER BY updated DESC').fetchall()
-        grouped = {}
         query_key = title_key(query)
         query_words = query_key.split()
+        with self.store.connect() as db:
+            if query_words:
+                match = ' AND '.join('"'+word+'"*' for word in query_words)
+                rows = db.execute('SELECT data FROM releases WHERE id IN (SELECT release FROM release_search WHERE release_search MATCH ?) ORDER BY updated DESC', (match,)).fetchall()
+                # Keep fuzzy matching for misspellings, but avoid parsing the entire catalog for normal searches.
+                if not rows:
+                    candidates = db.execute('SELECT release,terms FROM release_search').fetchall()
+                    ids = [r['release'] for r in candidates if WRatio(query_key,r['terms']) >= 75][:2000]
+                    rows = db.execute('SELECT data FROM releases WHERE id IN ('+(','.join('?' for _ in ids) or 'NULL')+') ORDER BY updated DESC', ids).fetchall()
+            else:
+                rows = db.execute('SELECT data FROM releases ORDER BY updated DESC LIMIT 2000').fetchall()
+        grouped = {}
         for row in rows:
             item = json.loads(row['data'])
             if not self.enabled(item):
@@ -261,7 +302,7 @@ class Catalog:
             for field in ('description', 'director'):
                 if not grouped[mid][field] and item.get(field):
                     grouped[mid][field] = item[field]
-            grouped[mid]['releases'].append(self.public(item))
+            grouped[mid]['releases'].append(self.source_public(item))
         return sorted(grouped.values(), key=lambda m: (not m['exact'], not m['keyword_match'], -m['score'], m['series'], m['title']))[:100]
 
     @staticmethod
@@ -270,6 +311,40 @@ class Catalog:
         if not result.get('resolution') or 'не указано' in result['resolution'].lower(): result['resolution'] = item.get('dimensions') or 'N\\A'
         result['animated'] = Catalog.animated(item)
         return result
+
+    def remember_availability(self, item):
+        self.availability[item['id']] = dict(seeds=item.get('seeds', 0), peers=item.get('peers', 0), availability_checked_at=time.time())
+
+    def source_public(self, item):
+        result = self.public(item)
+        current = self.availability.get(item['id'], {})
+        known = current.get('availability_checked_at', 0) > time.time()-300
+        result.update(current if known else dict(seeds=0, peers=0, availability_checked_at=0))
+        result.update(availability_known=known, swarm_stale=not known)
+        return result
+
+    def background(self, key, mapping, operation, cooldown=60):
+        previous = mapping.get(key)
+        if previous and (not previous[1].done() or time.monotonic()-previous[0] < cooldown):
+            return previous[1]
+        async def run():
+            try:
+                await operation()
+            except Exception:
+                log.exception('Background catalog refresh failed: %s', key)
+        task = asyncio.create_task(run())
+        mapping[key] = (time.monotonic(), task)
+        self.refresh_tasks.add(task)
+        task.add_done_callback(self.refresh_tasks.discard)
+        for old, value in list(mapping.items()):
+            if value[1].done() and time.monotonic()-value[0] > 600:
+                del mapping[old]
+        return task
+
+    def refresh_search(self, query):
+        async def refresh():
+            await asyncio.gather(*(asyncio.wait_for(self.provider_search(p,query),25) for p in self.config['providers']), return_exceptions=True)
+        self.background(query,self.search_refresh,refresh)
 
     @staticmethod
     def animated(item):
@@ -350,15 +425,29 @@ class Catalog:
         items = self.movie_releases(mid)
         if not items:
             return None
-        # Return the refreshed counters in this response, not in a discarded background task.
-        refresh_started = time.time()
+        self.background(mid, self.movie_refresh, lambda: self.refresh_movie(mid))
+        return self.movie_snapshot(mid, items)
+
+    def movie_snapshot(self, mid, items=None):
+        items = items or self.movie_releases(mid)
+        if not items:
+            return None
+        best = max(items, key=lambda i: len(i.get('description', '')))
+        return {'id': mid, 'series': any(i.get('series') for i in items), 'animated': any(self.animated(i) for i in items), **{k: best[k] for k in ('title', 'year', 'director', 'description')},
+                'releases': [self.source_public(i) for i in items],
+                'aliases': list({mid, *(a for i in items for a in i.get('movie_aliases', []) if a), *(i['movie'] for i in items)})}
+
+    async def refresh_movie(self, mid):
+        items = self.movie_releases(mid)
+        if not items:
+            return
         async def refresh(provider):
             try:
                 return await asyncio.wait_for(self.provider_search(provider, items[0]['title']), timeout=20)
             except TimeoutError:
                 return provider
         providers = {i['provider'] for i in items if i['provider'] in self.config['providers']}
-        failed = [p for p in await asyncio.gather(*(refresh(p) for p in providers)) if p]
+        await asyncio.gather(*(refresh(p) for p in providers))
         # One useful detail per card is enough for its poster and synopsis.
         if not any(i.get('description') and i.get('poster') for i in items):
             for item in sorted(items, key=lambda i: (i['provider'] != 'kinozal', -i.get('seeds', 0)))[:2]:
@@ -368,13 +457,6 @@ class Catalog:
                     continue
                 if detailed and detailed.get('description') and detailed.get('poster'):
                     break
-        items = self.movie_releases(mid)
-        best = max(items, key=lambda i: len(i.get('description', '')))
-        return {'id': mid, 'series': any(i.get('series') for i in items), 'animated': any(self.animated(i) for i in items), **{k: best[k] for k in ('title', 'year', 'director', 'description')},
-                'releases': [self.public(i) | {'swarm_stale': i['provider'] != 'local' and i.get('checked_at', 0) < refresh_started}
-                             for i in sorted(items, key=lambda i: (i.get('season', ''), -i.get('seeds', 0)))],
-                'swarm_refresh_failed': failed,
-                'aliases': list({mid, *(a for i in items for a in i.get('movie_aliases', []) if a), *(i['movie'] for i in items)})}
 
     async def enrich(self, movies):
         async def one(movie):

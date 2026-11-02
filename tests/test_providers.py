@@ -31,11 +31,12 @@ def test_disabled_cached_sources_never_return_or_make_requests(tmp_path):
             assert len(catalog.movies()) == 1
             movie = await catalog.movie(mid)
             assert {r['provider'] for r in movie['releases']} == {'rutracker', 'kinozal', 'local'}
+            await asyncio.gather(*catalog.refresh_tasks)
             assert calls and all(path.endswith(('/kinozal', '/rutracker')) for path in calls)
             # Old rows remain stored; account history and cached payload need no destructive migration.
             with catalog.store.connect() as db:
                 assert db.execute('SELECT COUNT(*) FROM releases').fetchone()[0] == 6
         finally:
-            await catalog.client.aclose()
+            await catalog.close()
 
     asyncio.run(check())

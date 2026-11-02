@@ -30,12 +30,12 @@ def parse(provider, html, path):
                 if following > page:
                     pages.append(following)
         if pages:
-            links.add(f'/browse.php?c={category}&page={min(pages)}')
+            links.update(f'/browse.php?c={category}&page={p}' for p in pages)
     else:
         root = soup.select_one('#c-2')
         is_index = path.startswith('/forum/index.php')
         if is_index:
-            containers = soup.select('#c-2, #c-18, #c-20')
+            containers = soup.select('#c-2, #c-18, #c-20, #c-28, #c-10, #c-39')
             if not containers:
                 raise ValueError('RuTracker categories unavailable')
             forums = [a for c in containers for a in c.select('.forumlink a[href], .subforums a[href]')]
@@ -66,12 +66,17 @@ def parse(provider, html, path):
                 if values.get('f', [''])[0] == forum and values.get('start', [''])[0].isdigit() and int(values['start'][0]) > start:
                     pages.append(int(values['start'][0]))
             if pages:
-                links.add(f'/forum/viewforum.php?f={forum}&start={min(pages)}')
+                links.update(f'/forum/viewforum.php?f={forum}&start={p}' for p in pages)
     return rows, sorted(links)
 
 
+def section(provider, path):
+    values = parse_qs(urlparse(path).query)
+    return ('category:'+values.get('c',['root'])[0]) if provider == 'kinozal' else ('forum:'+values.get('f',['root'])[0])
+
+
 async def page(metadata, provider, path):
-    valid = r'/browse\.php\?c=(?:1001|1002|1003|1006)&page=\d+' if provider == 'kinozal' else r'/forum/(?:index\.php|viewforum\.php\?f=\d+(?:&start=\d+)?)'
+    valid = r'/browse\.php\?c=(?:1|1001|1002|1003|1006)&page=\d+' if provider == 'kinozal' else r'/forum/(?:index\.php|viewforum\.php\?f=\d+(?:&start=\d+)?)'
     if not re.fullmatch(valid, path):
         raise ValueError('Invalid archive cursor')
     html = await metadata.html(provider, path)

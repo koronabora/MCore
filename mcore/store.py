@@ -35,6 +35,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS source_files (release TEXT, file INTEGER, data TEXT, PRIMARY KEY(release,file));
                 CREATE TABLE IF NOT EXISTS metadata_only_torrents (torrent TEXT PRIMARY KEY);
                 CREATE TABLE IF NOT EXISTS source_index_jobs (release TEXT PRIMARY KEY, due REAL, attempts INTEGER DEFAULT 0, error TEXT DEFAULT '', completed REAL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS source_index_due ON source_index_jobs(completed,due);
+                CREATE TABLE IF NOT EXISTS source_versions (release TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS archive_seen (provider TEXT, section TEXT, release TEXT, seen REAL, PRIMARY KEY(provider,section,release));
+                CREATE INDEX IF NOT EXISTS sync_pending ON sync_jobs(kind,completed,due);
+                CREATE VIRTUAL TABLE IF NOT EXISTS release_search USING fts5(release UNINDEXED, terms, tokenize='unicode61');
+                CREATE TABLE IF NOT EXISTS release_search_keys (release TEXT PRIMARY KEY, row_id INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS season_metadata (movie TEXT, season INTEGER, total INTEGER, origin TEXT, PRIMARY KEY(movie,season));
                 CREATE TABLE IF NOT EXISTS external_episodes (movie TEXT, episode TEXT, external_id TEXT, season INTEGER, number INTEGER, PRIMARY KEY(movie,episode));
             ''')
