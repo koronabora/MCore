@@ -9,7 +9,7 @@ from pathlib import PurePath
 from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
 from .config import load
 from .store import Store
@@ -19,6 +19,7 @@ from .images import image_bytes
 from .inspection import Inspection
 from . import episodes
 from . import telemetry
+from . import updates
 from .source_index import SourceIndex
 
 
@@ -93,6 +94,17 @@ def pair(body: Pair):
 @app.get('/v1/health')
 def health(uid=Depends(user)):
     return {'status': 'ok', 'service': 'MCore', 'version': app.version, 'sync': app.state.catalog.sync_status}
+
+
+@app.get('/v1/app-update')
+def app_update(uid=Depends(user)):
+    return updates.latest(app.state.catalog.config['state_dir'])
+
+
+@app.get('/v1/app-update/{digest}.apk')
+def app_update_apk(digest: str, uid=Depends(user)):
+    return FileResponse(updates.artifact(app.state.catalog.config['state_dir'], digest),
+                        media_type='application/vnd.android.package-archive', filename='MApp.apk')
 
 
 @app.get('/v1/search')
